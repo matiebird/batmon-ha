@@ -1,7 +1,7 @@
 name: "Batmon"
 description: "Monitor various BMS over bluetooth"
 url: https://github.com/fl4p/batmon-ha
-version: "2.09"
+version: "2.09.1"
 slug: "batmon"
 init: false
 host_dbus: true
@@ -86,8 +86,8 @@ schema:
       adapter: "str?"
       algorithm: "str?"
       current_calibration: "float?"
-      # Read-only discovery for `type: daly_full_ble` (aiobmsble Daly + extra D2
-      # block reads). No settings writes; leave false unless probing register map.
+      # For `type: daly_full_ble`: decoded D2 telemetry plus staged writable DALY
+      # controls in HA. No writes occur without explicit Apply; leave false unless needed.
       enable_daly_full_readout: "bool?"
       note: "str?"
 
