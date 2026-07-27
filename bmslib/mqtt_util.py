@@ -245,13 +245,62 @@ sample_desc = {
         "state_class": "measurement",
         "unit_of_measurement": "N",
         "icon": "counter"},
+    "bms/rated_capacity": {
+        "field": "rated_capacity",
+        "device_class": None,
+        "state_class": "measurement",
+        "unit_of_measurement": "Ah",
+        "precision": 1,
+        "icon": "battery-arrow-up-outline",
+        "entity_category": "diagnostic",
+    },
+    "bms/nominal_cell_voltage": {
+        "field": "nominal_cell_voltage",
+        "device_class": "voltage",
+        "state_class": "measurement",
+        "unit_of_measurement": "V",
+        "precision": 3,
+        "entity_category": "diagnostic",
+    },
+    "bms/production_date": {
+        "field": "production_date",
+        "device_class": None,
+        "state_class": None,
+        "unit_of_measurement": None,
+        "string_field": True,
+        "entity_category": "diagnostic",
+        "icon": "calendar",
+    },
+    "bms/software_version": {
+        "field": "software_version",
+        "device_class": None,
+        "state_class": None,
+        "unit_of_measurement": None,
+        "string_field": True,
+        "entity_category": "diagnostic",
+        "icon": "chip",
+    },
+    "bms/hardware_version": {
+        "field": "hardware_version",
+        "device_class": None,
+        "state_class": None,
+        "unit_of_measurement": None,
+        "string_field": True,
+        "entity_category": "diagnostic",
+        "icon": "memory",
+    },
 }
 
 
 def publish_sample(client, device_topic, sample: BmsSample):
     for k, v in sample_desc.items():
         topic = f"{device_topic}/{k}"
-        s = round_to_n(getattr(sample, v['field']), v.get('significant_digits', 5))
+        val = getattr(sample, v['field'])
+        if v.get('string_field'):
+            if val:
+                mqtt_single_out(client, topic, val)
+            continue
+        s = round_to_n(val, v.get('significant_digits', 5))
         if not is_none_or_nan(s):
             mqtt_single_out(client, topic, s)
 
@@ -328,7 +377,7 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
     }
 
     def _hass_discovery(k, device_class, unit, state_class=None, icon=None, name=None, long_expiry=False,
-                        precision=None):
+                        precision=None, entity_category=None):
         dm = {
             "unique_id": f"{device_topic}__{k.replace('/', '_')}",
             "name": name or capitalize_words(k.replace('/', ' ')),
@@ -343,6 +392,8 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
             "expire_after": max(expire_after_seconds, 3600 * 2) if long_expiry else expire_after_seconds,
             "device": device_json,
         }
+        if entity_category:
+            dm["entity_category"] = entity_category
         if icon:
             dm['icon'] = 'mdi:' + icon
         remove_none_values(dm)
@@ -350,14 +401,20 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
         discovery_msg[f"homeassistant/sensor/{node_id}/_{k.replace('/', '_')}/config"] = dm
 
     for k, d in sample_desc.items():
-        if not is_none_or_nan(getattr(sample, d["field"])):
-            _hass_discovery(k, d["device_class"],
-                            state_class=d["state_class"],
-                            unit=d["unit_of_measurement"],
-                            icon=d.get('icon', None),
-                            name=capitalize_words(d["field"]),
-                            precision=d.get("precision", None)
-                            )
+        val = getattr(sample, d["field"])
+        if d.get("string_field"):
+            if not val:
+                continue
+        elif is_none_or_nan(val):
+            continue
+        _hass_discovery(k, d["device_class"],
+                        state_class=d["state_class"],
+                        unit=d["unit_of_measurement"],
+                        icon=d.get('icon', None),
+                        name=capitalize_words(d["field"]),
+                        precision=d.get("precision", None),
+                        entity_category=d.get("entity_category"),
+                        )
 
     for i in range(0, num_cells):
         k = 'cell_voltages/%d' % (i + 1)

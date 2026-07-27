@@ -46,7 +46,12 @@ class BmsSample:
                  battery_charging: Optional[bool] = None,
                  battery_mode: Optional[str] = None,
                  total_charge_net: float = math.nan,
-                 uptime=math.nan, timestamp: Optional[float] = None):
+                 uptime=math.nan, timestamp: Optional[float] = None,
+                 rated_capacity: float = math.nan,
+                 nominal_cell_voltage: float = math.nan,
+                 production_date: Optional[str] = None,
+                 software_version: Optional[str] = None,
+                 hardware_version: Optional[str] = None):
         """
 
         :param voltage:
@@ -123,6 +128,11 @@ class BmsSample:
         self.total_charge_net: float = total_charge_net
         self.uptime = uptime
         self.timestamp = timestamp or time.time()
+        self.rated_capacity: float = rated_capacity
+        self.nominal_cell_voltage: float = nominal_cell_voltage
+        self.production_date: Optional[str] = production_date
+        self.software_version: Optional[str] = software_version
+        self.hardware_version: Optional[str] = hardware_version
 
         self.num_samples = 0
 

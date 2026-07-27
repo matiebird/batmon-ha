@@ -8,6 +8,16 @@ fixtures below capture that 8-byte payload, which is what ``_q`` returns
 directly.
 """
 
+from bmslib.models.daly import calc_crc
+
+
+def wrap_ble_response(cmd: int, payload: bytes) -> bytes:
+    """Complete 13-byte BMS→host BLE response as delivered by Bleak notify."""
+    assert len(payload) == 8
+    frame = bytes([0xA5, 0x01, cmd, 0x08]) + payload
+    return frame + bytes([calc_crc(frame)])
+
+
 # Status (cmd 0x93) — from in-source comments in bmslib/models/daly.py:237-245.
 # The C-style format is ">b ? ? B l": mode, charging_mosfet, discharging_mosfet,
 # unused_byte, capacity_in_mAh (signed 32-bit BE).
@@ -74,3 +84,100 @@ SOC_SYNTHETIC_265V_5A = dict(
 )
 
 ALL_SOC = [SOC_SYNTHETIC_265V_5A]
+
+
+# Rated parameters (cmd 0x50) — 8-byte payload: BE u32 rated capacity mAh,
+# 2 reserved bytes, BE u16 nominal cell voltage mV (`>L2xH`).
+RATED_PARAMS_310AH_3200MV = dict(
+    name="daly_rated_310ah_3200mv",
+    cmd=0x50,
+    raw=bytes.fromhex("0004baf000000c80"),
+    expected=dict(
+        rated_capacity=310.0,
+        nominal_cell_voltage=3.2,
+    ),
+)
+
+RATED_PARAMS_EXACT_FRAME_NONZERO_RESERVED = dict(
+    name="daly_rated_exact_frame_reserved",
+    cmd=0x50,
+    raw=bytes.fromhex("0004baf0abcd0c80"),
+    expected=dict(
+        rated_capacity=310.0,
+        nominal_cell_voltage=3.2,
+    ),
+)
+
+RATED_PARAMS_MIN_BOUNDARY = dict(
+    name="daly_rated_min_boundary",
+    cmd=0x50,
+    raw=bytes.fromhex("00000001000009c4"),  # 1 mAh, 2500 mV
+    expected=dict(
+        rated_capacity=0.001,
+        nominal_cell_voltage=2.5,
+    ),
+)
+
+RATED_PARAMS_MAX_BOUNDARY = dict(
+    name="daly_rated_max_boundary",
+    cmd=0x50,
+    raw=bytes.fromhex("001e848000001194"),  # 2_000_000 mAh, 4500 mV
+    expected=dict(
+        rated_capacity=2000.0,
+        nominal_cell_voltage=4.5,
+    ),
+)
+
+ALL_RATED_PARAMS = [
+    RATED_PARAMS_310AH_3200MV,
+    RATED_PARAMS_EXACT_FRAME_NONZERO_RESERVED,
+    RATED_PARAMS_MIN_BOUNDARY,
+    RATED_PARAMS_MAX_BOUNDARY,
+]
+
+
+# Production date (cmd 0x53) — bytes 2,3,4 are year since 2000, month, day.
+PRODUCTION_DATE_2024_06_15 = dict(
+    name="daly_production_2024_06_15",
+    cmd=0x53,
+    raw=bytes.fromhex("000018060f000000"),
+    expected=dict(production_date="2024-06-15"),
+)
+
+PRODUCTION_DATE_LEAP_2024_02_29 = dict(
+    name="daly_production_leap_2024_02_29",
+    cmd=0x53,
+    raw=bytes.fromhex("000018021d000000"),
+    expected=dict(production_date="2024-02-29"),
+)
+
+ALL_PRODUCTION_DATES = [
+    PRODUCTION_DATE_2024_06_15,
+    PRODUCTION_DATE_LEAP_2024_02_29,
+]
+
+
+def _version_frames(text: str):
+    assert len(text) == 14
+    return [
+        bytes([1]) + text[:7].encode("ascii"),
+        bytes([2]) + text[7:].encode("ascii"),
+    ]
+
+
+SOFTWARE_VERSION_CAPTURED = dict(
+    name="daly_sw_version_captured",
+    cmd=0x62,
+    frames=_version_frames("20210222-1.01T"),
+    expected=dict(software_version="20210222-1.01T"),
+)
+
+HARDWARE_VERSION_CAPTURED = dict(
+    name="daly_hw_version_captured",
+    cmd=0x63,
+    frames=_version_frames("DL-BMS-R32-01E"),
+    expected=dict(hardware_version="DL-BMS-R32-01E"),
+)
+
+ALL_SOFTWARE_VERSIONS = [SOFTWARE_VERSION_CAPTURED]
+ALL_HARDWARE_VERSIONS = [HARDWARE_VERSION_CAPTURED]

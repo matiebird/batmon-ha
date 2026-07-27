@@ -15,10 +15,11 @@ B4:E8:42:C2:84:13
 
 """
 import asyncio
+import datetime
 import math
 import struct
 import time
-from typing import Dict
+from typing import Dict, Optional
 
 from bmslib.bms import BmsSample
 from bmslib.bt import BtBms, enumerate_services
@@ -27,6 +28,94 @@ from bmslib.cache.mem import mem_cache_deco
 
 def calc_crc(message_bytes):
     return sum(message_bytes) & 0xFF
+
+
+# Stage 1 read-only settings bounds (cmd 0x50–0x63).
+DALY_RATED_PARAMS_PAYLOAD_LEN = 8
+DALY_PRODUCTION_DATE_PAYLOAD_LEN = 8
+DALY_VERSION_FRAME_PAYLOAD_LEN = 8
+DALY_VERSION_FRAME_COUNT = 2
+DALY_VERSION_ASCII_LEN = 7
+MAX_RATED_CAPACITY_MAH = 2_000_000  # 2000 Ah — large stationary packs
+MIN_NOMINAL_CELL_VOLTAGE_MV = 2500
+MAX_NOMINAL_CELL_VOLTAGE_MV = 4500
+DIAGNOSTIC_CACHE_TTL = 3600
+
+
+def _require_bytes_payload(payload, context: str, length: int) -> bytes:
+    if type(payload) is bool or isinstance(payload, int):
+        raise TypeError(f"{context} payload must be bytes-like")
+    if isinstance(payload, (bytes, bytearray, memoryview)):
+        normalized = bytes(payload)
+    else:
+        raise TypeError(f"{context} payload must be bytes-like")
+    if len(normalized) != length:
+        raise ValueError(f"{context} payload must be {length} bytes")
+    return normalized
+
+
+def parse_enable_daly_diagnostics(value, default: bool = False) -> bool:
+    if value is None:
+        return default
+    if type(value) is not bool:
+        raise TypeError("enable_daly_diagnostics must be a bool")
+    return value
+
+
+def parse_rated_parameters_payload(payload) -> dict:
+    """Parse cmd 0x50: BE u32 rated capacity mAh, 2 reserved bytes, BE u16 nominal mV."""
+    payload = _require_bytes_payload(payload, "Daly rated parameters", DALY_RATED_PARAMS_PAYLOAD_LEN)
+    capacity_mah, cell_volt_mv = struct.unpack(">L2xH", payload)
+    if capacity_mah <= 0:
+        raise ValueError("Daly rated capacity must be positive")
+    if capacity_mah > MAX_RATED_CAPACITY_MAH:
+        raise ValueError("Daly rated capacity exceeds maximum")
+    if cell_volt_mv < MIN_NOMINAL_CELL_VOLTAGE_MV or cell_volt_mv > MAX_NOMINAL_CELL_VOLTAGE_MV:
+        raise ValueError("Daly nominal cell voltage out of range")
+    return {
+        "rated_capacity": capacity_mah / 1000,
+        "nominal_cell_voltage": cell_volt_mv / 1000,
+    }
+
+
+def parse_production_date_payload(payload) -> str:
+    """Parse cmd 0x53 response bytes 2,3,4 as year since 2000, month, day."""
+    payload = _require_bytes_payload(payload, "Daly production date", DALY_PRODUCTION_DATE_PAYLOAD_LEN)
+    _, _, year_off, month, day = struct.unpack(">BBBBB", payload[:5])
+    if month < 1 or month > 12:
+        raise ValueError("Daly production date month invalid")
+    if day < 1 or day > 31:
+        raise ValueError("Daly production date day invalid")
+    year = 2000 + year_off
+    try:
+        datetime.date(year, month, day)
+    except ValueError:
+        raise ValueError("Daly production date invalid calendar date")
+    return f"{year:04d}-{month:02d}-{day:02d}"
+
+
+def parse_version_frames_payload(frames, context: str) -> str:
+    """Parse cmd 0x62/0x63: two 8-byte frames, seq 1 then 2, 7 printable ASCII bytes each."""
+    if type(frames) not in (list, tuple):
+        raise TypeError(f"{context} frames must be a list or tuple")
+    if len(frames) != DALY_VERSION_FRAME_COUNT:
+        raise ValueError(f"{context} requires {DALY_VERSION_FRAME_COUNT} frames")
+    parts = []
+    for i, frame in enumerate(frames):
+        frame = _require_bytes_payload(frame, context, DALY_VERSION_FRAME_PAYLOAD_LEN)
+        seq = frame[0]
+        if seq != i + 1:
+            raise ValueError(f"{context} frame sequence invalid")
+        chunk = frame[1:8]
+        if len(chunk) != DALY_VERSION_ASCII_LEN:
+            raise ValueError(f"{context} frame ASCII length invalid")
+        if any(b == 0 or b < 32 or b > 126 for b in chunk):
+            raise ValueError(f"{context} frame contains non-printable ASCII")
+        parts.append(chunk.decode("ascii"))
+    identity = "".join(parts)
+    if not identity:
+        raise ValueError(f"{context} identity empty")
+    return identity
 
 
 def daly_command_message(command: int, extra="", address: int = 8):
@@ -65,8 +154,11 @@ class DalyBt(BtBms):
     WIRE_ADDRESS = 8
 
     def __init__(self, address, **kwargs):
+        self.enable_daly_diagnostics = parse_enable_daly_diagnostics(
+            kwargs.pop("enable_daly_diagnostics", False))
+        pin = kwargs.get('pin')
         super().__init__(address, **kwargs)
-        if kwargs.get('pin'):
+        if pin:
             self.logger.warning('Daly usually does not use a pairing PIN')
         self.UUID_RX = None
         self.UUID_TX = None
@@ -74,6 +166,8 @@ class DalyBt(BtBms):
         # self._num_cells = 0
         self._states = None
         self._last_response = None
+        self._diag_cache: Dict[str, tuple] = {}
+        self._diag_logged: set = set()
 
     async def get_states_cached(self, key):
         if not self._states:
@@ -198,6 +292,10 @@ class DalyBt(BtBms):
         #    await self.client.write_gatt_char(self.UUID_TX, msg)
 
     async def fetch(self) -> BmsSample:
+        diagnostics = {}
+        if self.enable_daly_diagnostics:
+            diagnostics = await self._gather_settings_diagnostics()
+
         status = await self._fetch_status()
 
         sample = await self.fetch_soc(sample_kwargs=dict(
@@ -207,8 +305,89 @@ class DalyBt(BtBms):
                 discharge=bool(status['discharging_mosfet'])
             ),
         ))
-        # self.logger.info(sample.switches)
+        if diagnostics:
+            self._apply_gathered_diagnostics(sample, diagnostics)
         return sample
+
+    def _diag_cache_get(self, key: str):
+        entry = self._diag_cache.get(key)
+        if entry and entry[0] > time.time():
+            return entry[1]
+        return None
+
+    def _diag_cache_set(self, key: str, outcome):
+        self._diag_cache[key] = (time.time() + DIAGNOSTIC_CACHE_TTL, outcome)
+
+    async def _run_cached_diagnostic(self, key: str, fetch_fn):
+        cached = self._diag_cache_get(key)
+        if cached is not None:
+            return cached if cached is not False else None
+        try:
+            result = await fetch_fn()
+            self._diag_cache_set(key, result)
+            return result
+        except (asyncio.CancelledError, KeyboardInterrupt, SystemExit):
+            raise
+        except Exception as e:
+            self._diag_cache_set(key, False)
+            if key not in self._diag_logged:
+                self.logger.info("%s Daly diagnostic %s unavailable: %s", self.name, key, e)
+                self._diag_logged.add(key)
+            return None
+
+    async def _gather_settings_diagnostics(self) -> dict:
+        diagnostics = {}
+        rated = await self._run_cached_diagnostic("rated_parameters", self.fetch_rated_parameters)
+        if rated:
+            diagnostics["rated_capacity"] = rated["rated_capacity"]
+            diagnostics["nominal_cell_voltage"] = rated["nominal_cell_voltage"]
+
+        production_date = await self._run_cached_diagnostic("production_date", self.fetch_production_date)
+        if production_date:
+            diagnostics["production_date"] = production_date
+
+        software_version = await self._run_cached_diagnostic(
+            "software_version", self.fetch_software_version)
+        if software_version:
+            diagnostics["software_version"] = software_version
+
+        hardware_version = await self._run_cached_diagnostic(
+            "hardware_version", self.fetch_hardware_version)
+        if hardware_version:
+            diagnostics["hardware_version"] = hardware_version
+        return diagnostics
+
+    def _apply_gathered_diagnostics(self, sample: BmsSample, diagnostics: dict):
+        for key, value in diagnostics.items():
+            setattr(sample, key, value)
+
+    async def fetch_rated_parameters(self) -> dict:
+        response_data = await self._q(0x50)
+        return parse_rated_parameters_payload(response_data)
+
+    async def fetch_rated_parameters_cached(self) -> Optional[dict]:
+        return await self._run_cached_diagnostic("rated_parameters", self.fetch_rated_parameters)
+
+    async def fetch_production_date(self) -> str:
+        response_data = await self._q(0x53)
+        return parse_production_date_payload(response_data)
+
+    async def fetch_production_date_cached(self) -> Optional[str]:
+        return await self._run_cached_diagnostic("production_date", self.fetch_production_date)
+
+    async def fetch_software_version(self) -> str:
+        response_data = await self._q(0x62, num_responses=DALY_VERSION_FRAME_COUNT)
+        return parse_version_frames_payload(response_data, "Daly software version")
+
+    async def fetch_software_version_cached(self) -> Optional[str]:
+        return await self._run_cached_diagnostic("software_version", self.fetch_software_version)
+
+    async def fetch_hardware_version(self) -> str:
+        response_data = await self._q(0x63, num_responses=DALY_VERSION_FRAME_COUNT)
+        return parse_version_frames_payload(response_data, "Daly hardware version")
+
+    async def fetch_hardware_version_cached(self) -> Optional[str]:
+        return await self._run_cached_diagnostic("hardware_version", self.fetch_hardware_version)
 
     async def fetch_soc(self, sample_kwargs=None):
         timestamp = time.time()

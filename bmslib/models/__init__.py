@@ -121,6 +121,13 @@ def construct_bms(dev: dict, verbose_log: bool, bt_discovered_devices: list):
         if probe_spec:
             extra_kwargs['probe'] = probe_spec
 
+    if slug in ('daly', 'daly_uart'):
+        eda = dev.get('enable_daly_diagnostics')
+        if eda is not None:
+            from bmslib.models.daly import parse_enable_daly_diagnostics
+            if parse_enable_daly_diagnostics(eda):
+                extra_kwargs['enable_daly_diagnostics'] = True
+
     bms_class = get_bms_model_class(slug)
 
     if bms_class is None:
