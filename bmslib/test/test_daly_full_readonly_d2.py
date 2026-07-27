@@ -224,6 +224,7 @@ def test_readout_failure_cached_fail_soft(monkeypatch):
     bms._await_msg = fail_all  # type: ignore[method-assign]
     asyncio.run(bms._maybe_full_readout())
     assert bms.diagnostic_readout is None
+    assert bms.decoded_settings is None
     assert calls == 1
 
     asyncio.run(bms._maybe_full_readout())
@@ -246,15 +247,25 @@ def test_readout_does_not_block_normal_on_failure():
     bms.super_update.assert_awaited_once()
 
 
-def test_readout_propagates_cancellation():
+def test_readout_propagates_cancellation(monkeypatch):
     bms = _StubDalyFull()
+    t = [3000.0]
+    monkeypatch.setattr(daly_full_bms.time, "time", lambda: t[0])
 
     async def cancel(data, *a, **k):
         raise asyncio.CancelledError
 
+    asyncio.run(bms._maybe_full_readout())
+    assert bms.decoded_settings is not None
+    cache_after_success = bms._readout_cache_until
+
+    t[0] += READOUT_CACHE_SECONDS + 1
     bms._await_msg = cancel  # type: ignore[method-assign]
     with pytest.raises(asyncio.CancelledError):
         asyncio.run(bms._maybe_full_readout())
+    assert bms.decoded_settings is None
+    assert bms.diagnostic_readout is None
+    assert bms._readout_cache_until == cache_after_success
 
 
 def test_diagnostic_readout_immutable_after_success():
@@ -264,8 +275,86 @@ def test_diagnostic_readout_immutable_after_success():
     assert ro is not None
     assert ro["protocol_unit"] == 0xD2
     assert ro["register_count"] == 0x50 + 0x1E
-    with pytest.raises(TypeError):
-        ro["blocks"] = ()  # type: ignore[index]
+    assert "blocks" not in ro
+    assert "998877" not in str(ro)
+
+
+def _frame_from_payload(payload: bytes) -> bytes:
+    body = bytes([0xD2, 0x03, len(payload)]) + payload
+    return body + crc_modbus(body).to_bytes(2, "little")
+
+
+def test_expired_failed_refresh_clears_stale_decoded_settings(monkeypatch):
+    from bmslib.test.test_daly_full_decode import build_fixture_blocks
+
+    b1, b2 = build_fixture_blocks()
+
+    class _FixtureStub(_StubDalyFull):
+        async def _await_msg(self, data, *a, **k):
+            self.await_calls.append(data)
+            if data == build_d2_read_frame(0x80, 0x50):
+                self._msg = _frame_from_payload(b1[1])
+            elif data == build_d2_read_frame(0xD0, 0x1E):
+                self._msg = _frame_from_payload(b2[1])
+            else:
+                raise AssertionError(data.hex())
+            self._msg_event.set()
+
+    bms = _FixtureStub()
+    t = [4000.0]
+    monkeypatch.setattr(daly_full_bms.time, "time", lambda: t[0])
+    asyncio.run(bms._maybe_full_readout())
+    assert bms.decoded_settings is not None
+    assert bms.decoded_settings.values["rated_capacity_ah"] == 310.0
+
+    t[0] += READOUT_CACHE_SECONDS + 1
+
+    async def fail_second(data, *a, **k):
+        raise TimeoutError("timeout")
+
+    bms._await_msg = fail_second  # type: ignore[method-assign]
+    asyncio.run(bms._maybe_full_readout())
+    assert bms.decoded_settings is None
+    assert bms.diagnostic_readout is None
+
+
+def test_notification_handler_never_logs_password_payload(caplog):
+    import logging
+    from bmslib.test.test_daly_full_decode import build_fixture_blocks
+
+    payload = build_fixture_blocks()[0][1]
+    frame = _frame_from_payload(payload)
+    bms = DalyFullBMS(MagicMock(), keep_alive=True)
+    bms._log.setLevel(logging.DEBUG)
+    with caplog.at_level(logging.DEBUG, logger=bms._log.name):
+        bms._notification_handler(None, bytearray(frame))
+
+    assert "998877" not in caplog.text
+    assert payload.hex() not in caplog.text
+    assert "len=%d" % len(frame) in caplog.text or "len=" in caplog.text
+    assert bms._msg == frame
+
+
+def test_daly_full_wrap_sample_has_readonly_switches():
+    wrap = BleWrapBMS(
+        "AA:BB:CC:DD:EE:FF",
+        type="daly_full_bms",
+        blebms_class=DalyFullBMS,
+    )
+    wrap.ble_bms = MagicMock()
+    wrap.ble_bms.decoded_settings = None
+    wrap.ble_bms.async_update = AsyncMock(
+        return_value={
+            "voltage": 52.0,
+            "current": 0.0,
+            "chrg_mosfet": True,
+            "dischrg_mosfet": False,
+        }
+    )
+    sample = asyncio.run(wrap.fetch())
+    assert sample.switches == {"charge": True, "discharge": False}
+    assert sample.switches_writable is False
+    assert sample.extra_values is None
 
 
 # --- BLE wrapper: one client, kwargs pass-through, telemetry mapping regression ---
@@ -511,6 +600,25 @@ def test_ble_wrap_uses_single_ble_bms_client(monkeypatch):
     asyncio.run(_run())
     assert len(instances) == 1
     assert wrap.ble_bms is instances[0]
+
+
+def test_ble_wrap_attaches_cached_decoded_settings():
+    wrap = BleWrapBMS(
+        "AA:BB:CC:DD:EE:FF",
+        type="daly_full_bms",
+        blebms_class=DalyFullBMS,
+    )
+    from bmslib.bms_ble.plugins.daly_full_decode import decode_daly_settings_blocks
+    from bmslib.test.test_daly_full_decode import build_fixture_blocks
+
+    wrap.ble_bms = MagicMock()
+    wrap.ble_bms.decoded_settings = decode_daly_settings_blocks(build_fixture_blocks())
+    wrap.ble_bms.async_update = AsyncMock(return_value={"voltage": 52.0, "current": 0.0, "cell_count": 0})
+    sample = asyncio.run(wrap.fetch())
+    assert sample.extra_values is not None
+    assert sample.extra_desc is not None
+    assert sample.extra_values["rated_capacity_ah"] == 310.0
+    assert "998877" not in str(sample.extra_values)
 
 
 def test_construct_bms_daly_full_ble_parses_option():

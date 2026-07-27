@@ -8,6 +8,7 @@ import asyncio
 import json
 import math
 import queue
+import re
 import statistics
 import time
 import traceback
@@ -16,6 +17,7 @@ from unittest.mock import patch
 import paho.mqtt.client as paho
 
 from bmslib.bms import BmsSample, DeviceInfo, MIN_VALUE_EXPIRY
+from bmslib.bms_ble.plugins.daly_full_decode import EXTRA_SENSOR_EXPIRY_SECONDS
 from bmslib.bt import BtBms
 from bmslib.util import get_logger
 
@@ -56,6 +58,21 @@ def round_to_n(x, n):
     except ValueError as e:
         print('error', x, n, e)
         raise e
+
+
+def format_extra_numeric(val, precision: int | None = None) -> str:
+    """Format extra sensor values with fixed decimal places (not significant digits)."""
+    if isinstance(val, str):
+        return val
+    fval = float(val)
+    if precision is None:
+        if fval.is_integer():
+            return str(int(fval))
+        return str(val)
+    p = int(precision)
+    if p == 0:
+        return str(int(round(fval)))
+    return f"{fval:.{p}f}"
 
 
 def capitalize_words(s):
@@ -124,6 +141,20 @@ def mqtt_last_publish_time():
 
 
 def is_none_or_nan(val):
+    if val is None:
+        return True
+    if isinstance(val, float) and (math.isnan(val) or not math.isfinite(val)):
+        return True
+    return False
+
+
+def is_valid_extra_topic_key(k: str) -> bool:
+    if not k or "//" in k:
+        return False
+    parts = k.split("/")
+    if len(parts) != 2 or parts[0] != "daly_config":
+        return False
+    return all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in parts)
     if val is None:
         return True
     if isinstance(val, float) and (math.isnan(val) or not math.isfinite(val)):
@@ -248,12 +279,39 @@ sample_desc = {
 }
 
 
+def publish_extra_values(client, device_topic, sample: BmsSample):
+    if not sample.extra_values or not sample.extra_desc:
+        return
+    for topic_key, meta in sample.extra_desc.items():
+        if not is_valid_extra_topic_key(topic_key):
+            logger.warning("skip invalid extra sensor topic key %r", topic_key)
+            continue
+        field = meta.get("field")
+        if not field:
+            continue
+        val = sample.extra_values.get(field)
+        if val is None:
+            continue
+        if isinstance(val, float) and not math.isfinite(val):
+            continue
+        topic = f"{device_topic}/{topic_key}"
+        if isinstance(val, bool):
+            mqtt_single_out(client, topic, "ON" if val else "OFF")
+        else:
+            precision = meta.get("precision")
+            if isinstance(val, (int, float)):
+                val = format_extra_numeric(val, precision)
+            mqtt_single_out(client, topic, val)
+
+
 def publish_sample(client, device_topic, sample: BmsSample):
     for k, v in sample_desc.items():
         topic = f"{device_topic}/{k}"
         s = round_to_n(getattr(sample, v['field']), v.get('significant_digits', 5))
         if not is_none_or_nan(s):
             mqtt_single_out(client, topic, s)
+
+    publish_extra_values(client, device_topic, sample)
 
     if sample.switches:
         for switch_name, switch_state in sample.switches.items():
@@ -328,7 +386,7 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
     }
 
     def _hass_discovery(k, device_class, unit, state_class=None, icon=None, name=None, long_expiry=False,
-                        precision=None):
+                        precision=None, entity_category=None):
         dm = {
             "unique_id": f"{device_topic}__{k.replace('/', '_')}",
             "name": name or capitalize_words(k.replace('/', ' ')),
@@ -340,14 +398,56 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
             "suggested_display_precision": precision,
             # "json_attributes_topic": f"{device_topic}/{k}",
             "state_topic": f"{device_topic}/{k}",
-            "expire_after": max(expire_after_seconds, 3600 * 2) if long_expiry else expire_after_seconds,
+            "expire_after": max(expire_after_seconds, EXTRA_SENSOR_EXPIRY_SECONDS) if long_expiry else expire_after_seconds,
             "device": device_json,
         }
+        if entity_category:
+            dm["entity_category"] = entity_category
         if icon:
             dm['icon'] = 'mdi:' + icon
         remove_none_values(dm)
         remove_none_values(dm['device'])
         discovery_msg[f"homeassistant/sensor/{node_id}/_{k.replace('/', '_')}/config"] = dm
+
+    def _hass_extra_discovery(topic_key: str, meta: dict):
+        if not is_valid_extra_topic_key(topic_key):
+            return
+        field = meta.get("field")
+        val = sample.extra_values.get(field) if sample.extra_values else None
+        if val is None:
+            return
+        if isinstance(val, float) and not math.isfinite(val):
+            return
+        long_expiry = meta.get("long_expiry", True)
+        expire = max(expire_after_seconds, EXTRA_SENSOR_EXPIRY_SECONDS) if long_expiry else expire_after_seconds
+        entity_category = meta.get("entity_category", "diagnostic")
+        name = meta.get("name") or capitalize_words(field.replace("_", " "))
+        if isinstance(val, bool):
+            discovery_msg[f"homeassistant/binary_sensor/{node_id}/_{topic_key.replace('/', '_')}/config"] = {
+                "unique_id": f"{device_topic}__{topic_key.replace('/', '_')}",
+                "name": name,
+                "entity_category": entity_category,
+                "state_topic": f"{device_topic}/{topic_key}",
+                "expire_after": expire,
+                "device": device_json,
+            }
+            return
+        dm = {
+            "unique_id": f"{device_topic}__{topic_key.replace('/', '_')}",
+            "name": name,
+            "device_class": meta.get("device_class"),
+            "state_class": meta.get("state_class"),
+            "unit_of_measurement": meta.get("unit_of_measurement"),
+            "native_unit_of_measurement": meta.get("unit_of_measurement"),
+            "suggested_display_precision": meta.get("precision"),
+            "entity_category": entity_category,
+            "state_topic": f"{device_topic}/{topic_key}",
+            "expire_after": expire,
+            "device": device_json,
+        }
+        remove_none_values(dm)
+        remove_none_values(dm['device'])
+        discovery_msg[f"homeassistant/sensor/{node_id}/_{topic_key.replace('/', '_')}/config"] = dm
 
     for k, d in sample_desc.items():
         if not is_none_or_nan(getattr(sample, d["field"])):
@@ -394,6 +494,10 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
     for name, m in meters.items():
         _hass_discovery('meter/%s' % name, **m, long_expiry=True, precision=2)
 
+    if sample.extra_desc and sample.extra_values:
+        for topic_key, meta in sample.extra_desc.items():
+            _hass_extra_discovery(topic_key, meta)
+
     if sample.problem is not None:
         discovery_msg[f"homeassistant/binary_sensor/{node_id}/problem/config"] = {
             "unique_id": f"{device_topic}__problem",
@@ -437,34 +541,49 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
         }
 
     switches = (sample.switches and sample.switches.keys())
+    switch_tombstones: list[str] = []
     if switches:
         for switch_name in switches:
-            discovery_msg[f"homeassistant/switch/{node_id}/{switch_name}/config"] = {
-                "unique_id": f"{device_topic}__switch_{switch_name}",
-                "name": f"{switch_name}",
-                "device_class": 'outlet',
-                # "json_attributes_topic": f"{device_topic}/{switch_name}",
-                "state_topic": f"{device_topic}/switch/{switch_name}",
-                "expire_after": expire_after_seconds,
-                "device": device_json,
-                "command_topic": f"homeassistant/switch/{node_id}/{switch_name}/set",
-            }
+            if sample.switches_writable:
+                discovery_msg[f"homeassistant/switch/{node_id}/{switch_name}/config"] = {
+                    "unique_id": f"{device_topic}__switch_{switch_name}",
+                    "name": f"{switch_name}",
+                    "device_class": 'outlet',
+                    "state_topic": f"{device_topic}/switch/{switch_name}",
+                    "expire_after": expire_after_seconds,
+                    "device": device_json,
+                    "command_topic": f"homeassistant/switch/{node_id}/{switch_name}/set",
+                }
 
-            discovery_msg[f"homeassistant/binary_sensor/{node_id}/{switch_name}/config"] = {
-                "unique_id": f"{device_topic}__switch_{switch_name}",
-                "name": f"{switch_name} switch",
-                "device_class": 'power',
-                # "json_attributes_topic": f"{device_topic}/{switch_name}",
-                "expire_after": expire_after_seconds,
-                "device": device_json,
-                "state_topic": f"{device_topic}/switch/{switch_name}",
-                "command_topic": f"homeassistant/switch/{node_id}/{switch_name}/set",
-            }
+                discovery_msg[f"homeassistant/binary_sensor/{node_id}/{switch_name}/config"] = {
+                    "unique_id": f"{device_topic}__switch_{switch_name}",
+                    "name": f"{switch_name} switch",
+                    "device_class": 'power',
+                    "expire_after": expire_after_seconds,
+                    "device": device_json,
+                    "state_topic": f"{device_topic}/switch/{switch_name}",
+                    "command_topic": f"homeassistant/switch/{node_id}/{switch_name}/set",
+                }
+            else:
+                switch_tombstones.append(f"homeassistant/switch/{node_id}/{switch_name}/config")
+                discovery_msg[f"homeassistant/binary_sensor/{node_id}/{switch_name}_state/config"] = {
+                    "unique_id": f"{device_topic}__switch_{switch_name}_readonly",
+                    "name": f"{switch_name} switch",
+                    "device_class": 'power',
+                    "entity_category": "diagnostic",
+                    "expire_after": expire_after_seconds,
+                    "device": device_json,
+                    "state_topic": f"{device_topic}/switch/{switch_name}",
+                }
 
     for topic, data in discovery_msg.items():
         j = json.dumps(data)
         logger.debug('discovery msg %s: %s', topic, j)
         mqtt_single_out(client, topic, j)
+
+    for topic in switch_tombstones:
+        logger.debug('discovery tombstone %s', topic)
+        mqtt_single_out(client, topic, "", retain=True)
 
 
 _switch_callbacks = {}

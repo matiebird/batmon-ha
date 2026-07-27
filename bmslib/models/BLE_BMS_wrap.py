@@ -234,6 +234,12 @@ class BMS():
             # enum class to be importable.
             mode = sample.get('battery_mode')
             battery_mode = mode.name if mode is not None and hasattr(mode, 'name') else None
+            extra_values = None
+            extra_desc = None
+            decoded = getattr(self.ble_bms, 'decoded_settings', None)
+            if decoded is not None:
+                extra_values = decoded.values
+                extra_desc = decoded.desc
             return BmsSample(
                 soc=sample.get('battery_level', math.nan),
                 soh=sample.get('battery_health', math.nan),
@@ -253,6 +259,9 @@ class BMS():
                 battery_charging=sample.get('battery_charging'),
                 battery_mode=battery_mode,
                 total_charge_net=sample.get('total_charge', math.nan),
+                extra_values=extra_values,
+                extra_desc=extra_desc,
+                switches_writable=self._type != 'daly_full_bms',
             )
         except Exception as e:
             raise ValueError('invalid ble_bms sample %r' % sample) from e

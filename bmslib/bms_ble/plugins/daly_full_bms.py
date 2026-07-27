@@ -14,7 +14,12 @@ from typing import Any, Final, Mapping, Optional
 
 from aiobmsble.basebms import crc_modbus
 from aiobmsble.bms.daly_bms import BMS as DalyBMS
+from bleak.backends.characteristic import BleakGATTCharacteristic
 
+from bmslib.bms_ble.plugins.daly_full_decode import (
+    DecodedDalySettings,
+    decode_daly_settings_blocks,
+)
 from bmslib.util import get_logger
 
 logger = get_logger()
@@ -109,10 +114,51 @@ class BMS(DalyBMS):
         self._enable_daly_full_readout = parse_enable_daly_full_readout(enable_daly_full_readout)
         self._readout_cache_until: float = 0.0
         self._diagnostic_readout: Optional[Mapping[str, Any]] = None
+        self._decoded_settings: Optional[DecodedDalySettings] = None
 
     @property
     def diagnostic_readout(self) -> Optional[Mapping[str, Any]]:
         return self._diagnostic_readout
+
+    @property
+    def decoded_settings(self) -> Optional[DecodedDalySettings]:
+        return self._decoded_settings
+
+    def _clear_readout_state(self) -> None:
+        self._decoded_settings = None
+        self._diagnostic_readout = None
+
+    def _notification_handler(
+        self, _sender: BleakGATTCharacteristic, data: bytearray
+    ) -> None:
+        unit = data[0] if len(data) >= 1 else 0
+        func = data[1] if len(data) >= 2 else 0
+        self._log.debug(
+            "RX BLE data: len=%d unit=0x%02X function=0x%02X",
+            len(data),
+            unit,
+            func,
+        )
+
+        if (
+            len(data) < DalyBMS._HEAD_LEN
+            or data[0:2] != DalyBMS._HEAD_READ
+            or data[2] + 1 != len(data) - len(DalyBMS._HEAD_READ) - DalyBMS._CRC_LEN
+        ):
+            self._log.debug("response data is invalid")
+            return
+
+        if not self._check_integrity(
+            data,
+            crc_modbus,
+            slice(None, -2),
+            slice(-2, None),
+            "little",
+        ):
+            return
+
+        self._msg = bytes(data)
+        self._msg_event.set()
 
     async def _maybe_full_readout(self) -> None:
         if not self._enable_daly_full_readout:
@@ -120,6 +166,8 @@ class BMS(DalyBMS):
         now = time.time()
         if now < self._readout_cache_until:
             return
+
+        self._clear_readout_state()
 
         try:
             blocks: list[tuple[int, bytes]] = []
@@ -135,27 +183,27 @@ class BMS(DalyBMS):
             covered = ",".join(
                 "0x%04X-0x%04X" % (block.addr, block.end_addr) for block in READOUT_BLOCKS
             )
-            hex_blocks = ",".join(data.hex() for _, data in immutable_blocks)
+            self._decoded_settings = decode_daly_settings_blocks(immutable_blocks)
             self._diagnostic_readout = MappingProxyType(
                 {
                     "protocol_unit": _PROTOCOL_UNIT,
                     "covered_ranges": covered,
                     "register_count": register_count,
-                    "blocks": immutable_blocks,
                 }
             )
             logger.info(
-                "Daly full readout unit=0x%02X ranges=%s registers=%d blocks=%s",
+                "Daly full readout unit=0x%02X ranges=%s registers=%d",
                 _PROTOCOL_UNIT,
                 covered,
                 register_count,
-                hex_blocks,
             )
+            self._readout_cache_until = now + READOUT_CACHE_SECONDS
         except asyncio.CancelledError:
+            self._clear_readout_state()
             raise
         except Exception as exc:
+            self._clear_readout_state()
             self._log.debug("Daly full readout failed (fail-soft): %s", exc)
-        finally:
             self._readout_cache_until = now + READOUT_CACHE_SECONDS
 
     async def _async_update(self):

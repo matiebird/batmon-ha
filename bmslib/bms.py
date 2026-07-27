@@ -1,7 +1,7 @@
 import math
 import time
 from copy import copy
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Mapping, Any
 
 MIN_VALUE_EXPIRY = 20
 
@@ -46,7 +46,10 @@ class BmsSample:
                  battery_charging: Optional[bool] = None,
                  battery_mode: Optional[str] = None,
                  total_charge_net: float = math.nan,
-                 uptime=math.nan, timestamp: Optional[float] = None):
+                 uptime=math.nan, timestamp: Optional[float] = None,
+                 extra_values: Optional[Mapping[str, Any]] = None,
+                 extra_desc: Optional[Mapping[str, dict]] = None,
+                 switches_writable: bool = True):
         """
 
         :param voltage:
@@ -123,6 +126,9 @@ class BmsSample:
         self.total_charge_net: float = total_charge_net
         self.uptime = uptime
         self.timestamp = timestamp or time.time()
+        self.extra_values = extra_values
+        self.extra_desc = extra_desc
+        self.switches_writable = switches_writable
 
         self.num_samples = 0
 
