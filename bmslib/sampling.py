@@ -18,6 +18,18 @@ from bmslib.cache.mem import mem_cache_deco
 from bmslib.group import BmsGroup, GroupNotReady
 from bmslib.mqtt_util import publish_sample, publish_cell_voltages, publish_temperatures, publish_hass_discovery, \
     subscribe_switches, mqtt_single_out
+from bmslib.bms_ble.plugins.daly_full_mqtt_controls import (
+    ACTION_APPLY,
+    ACTION_ARM,
+    ACTION_DISCARD,
+    ACTION_RESTART,
+    ACTION_RESTORE,
+    publish_daly_full_discovery,
+    publish_daly_full_state,
+    publish_daly_full_tombstones,
+    subscribe_daly_full_controls,
+)
+from bmslib.bms_ble.plugins.daly_full_write_registry import WRITE_FIELDS_BY_KEY
 from bmslib.pwmath import Integrator, DiffAbsSum, LHQ
 from bmslib.util import get_logger, summarize_exc
 
@@ -351,6 +363,9 @@ class BmsSampler:
                 subscribe_switches(mqtt_client, device_topic=self.mqtt_topic_prefix, bms=bms,
                                    switches=sample.switches.keys())
 
+            if self.num_samples == 0 and getattr(bms, 'daly_writable', False) and mqtt_client:
+                self._subscribe_daly_full_controls(bms, mqtt_client)
+
             for sink in self.sinks:
                 try:
                     sink.publish_sample(bms.name, sample)
@@ -412,6 +427,13 @@ class BmsSampler:
                 sample = self.downsampler.pop()
 
                 publish_sample(mqtt_client, device_topic=self.mqtt_topic_prefix, sample=sample)
+                if getattr(self.bms, 'daly_writable', False) and self.bms.daly_staging is not None:
+                    publish_daly_full_state(
+                        mqtt_client,
+                        self.mqtt_topic_prefix,
+                        self.bms.daly_staging,
+                        self.bms.current_daly_values(),
+                    )
                 log_data and logger.info('%s: %s', bms.name, sample)
 
                 voltages = await cached_fetch_voltages()
@@ -452,6 +474,25 @@ class BmsSampler:
                     temperatures=sample.temperatures,
                     device_info=self.device_info,
                 )
+                if getattr(self.bms, 'daly_full_capable', False):
+                    if getattr(self.bms, 'daly_writable', False):
+                        if self.device_info is None:
+                            await self._try_fetch_device_info()
+                        if self.device_info is not None:
+                            device_json = {
+                                "identifiers": [self.device_info.sn or self.mqtt_topic_prefix],
+                                "manufacturer": self.device_info.mnf,
+                                "name": self.device_info.name or self.mqtt_topic_prefix,
+                                "model": self.device_info.model,
+                            }
+                            publish_daly_full_discovery(
+                                mqtt_client,
+                                self.mqtt_topic_prefix,
+                                device_json,
+                                self.expire_after_seconds,
+                            )
+                    else:
+                        publish_daly_full_tombstones(mqtt_client, self.mqtt_topic_prefix)
 
                 # publish sample again after discovery
                 if self.period_pub.period > 2:
@@ -506,6 +547,56 @@ class BmsSampler:
             pass
         except Exception as e:
             logger.warning('%s error fetching device info: %s', self.bms.name, e)
+
+    def _subscribe_daly_full_controls(self, bms, mqtt_client):
+        from bmslib.bms_ble.plugins.daly_full_write_registry import EntityType
+
+        async def _apply(_payload: str):
+            logger.info('%s apply pending DALY settings', bms.name)
+            await bms.apply_daly_pending()
+
+        async def _discard(_payload: str):
+            logger.info('%s discard pending DALY settings', bms.name)
+            bms.discard_daly_pending()
+
+        async def _restore(_payload: str):
+            logger.info('%s restore last DALY settings', bms.name)
+            await bms.restore_daly_settings()
+
+        async def _arm(payload: str):
+            if payload.lower() == 'on':
+                logger.info('%s arm advanced DALY operations', bms.name)
+                bms.arm_daly_advanced()
+
+        async def _restart(_payload: str):
+            logger.info('%s restart DALY BMS', bms.name)
+            await bms.restart_daly_system()
+
+        handlers = {
+            ACTION_APPLY: _apply,
+            ACTION_DISCARD: _discard,
+            ACTION_RESTORE: _restore,
+            ACTION_ARM: _arm,
+            ACTION_RESTART: _restart,
+        }
+
+        for key, field in WRITE_FIELDS_BY_KEY.items():
+            if field.entity_type == EntityType.NUMBER:
+
+                async def _stage_number(payload: str, k=key):
+                    bms.stage_daly_setting(k, float(payload))
+
+                handlers[key] = _stage_number
+            elif field.entity_type == EntityType.SELECT:
+
+                async def _stage_select(payload: str, k=key):
+                    bms.stage_daly_setting(k, payload)
+
+                handlers[key] = _stage_select
+
+        logger.info('%s subscribing for DALY writable controls', bms.name)
+        subscribe_daly_full_controls(
+            mqtt_client, self.mqtt_topic_prefix, handlers, staging=bms.daly_staging)
 
 
 class Downsampler:

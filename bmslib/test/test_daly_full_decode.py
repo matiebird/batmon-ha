@@ -80,7 +80,7 @@ def build_fixture_blocks(**overrides: int | str) -> tuple[tuple[int, bytes], tup
         0x91: 4400,
         0x92: 4200,
         0x93: 30100,
-        0x94: 30050,
+        0x94: 29850,
         0x95: 29900,
         0x96: 29850,
         0x97: 85,

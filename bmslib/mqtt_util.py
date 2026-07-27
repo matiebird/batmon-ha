@@ -155,11 +155,6 @@ def is_valid_extra_topic_key(k: str) -> bool:
     if len(parts) != 2 or parts[0] != "daly_config":
         return False
     return all(re.fullmatch(r"[A-Za-z0-9_.-]+", p) for p in parts)
-    if val is None:
-        return True
-    if isinstance(val, float) and (math.isnan(val) or not math.isfinite(val)):
-        return True
-    return False
 
 
 # units: https://github.com/home-assistant/core/blob/d7ac4bd65379e11461c7ce0893d3533d8d8b8cbf/homeassistant/const.py#L384
@@ -619,7 +614,14 @@ def subscribe_switches(mqtt_client: paho.Client, device_topic, bms: BtBms, switc
 
 
 def mqtt_message_handler(client, userdata, message: paho.MQTTMessage):
-    payload = message.payload.decode("utf-8")
+    from bmslib.bms_ble.plugins.daly_full_mqtt_controls import enqueue_daly_action
+    if enqueue_daly_action(message.topic, message.payload, retain=bool(message.retain)):
+        return
+    try:
+        payload = message.payload.decode("utf-8")
+    except UnicodeError:
+        logger.warning("mqtt payload decode failed on topic %s", message.topic)
+        return
     logger.info("received msg %s: %s", message.topic, payload)
     callback = _switch_callbacks.get(message.topic, None)
     if callback:

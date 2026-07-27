@@ -1,7 +1,6 @@
-"""BatMon read-only extension of aiobmsble's Daly BMS (D2 Modbus over FFF0/FFF1/FFF2).
+"""BatMon Daly BMS extension (D2 Modbus over FFF0/FFF1/FFF2).
 
-Stage: discovery-only. Issues official-app read-only D2 function-03 block reads
-before normal telemetry when ``enable_daly_full_readout`` is true. No writes.
+Supports hourly read-only extended register map and allowlisted D2 writes.
 """
 
 from __future__ import annotations
@@ -20,13 +19,22 @@ from bmslib.bms_ble.plugins.daly_full_decode import (
     DecodedDalySettings,
     decode_daly_settings_blocks,
 )
+from bmslib.bms_ble.plugins.daly_full_protocol import (
+    PROTOCOL_UNIT,
+    READ_FUNCTION,
+    WRITE_FUNCTION,
+    WRITE_FRAME_LEN,
+    build_d2_read_frame,
+    build_field_write_frame,
+    build_restart_write_frame,
+    validate_d2_write_echo,
+)
+from bmslib.bms_ble.plugins.daly_full_write_registry import WRITE_FIELDS_BY_KEY, encode_field
 from bmslib.util import get_logger
 
 logger = get_logger()
 
 READOUT_CACHE_SECONDS: Final[int] = 3600
-_PROTOCOL_UNIT: Final[int] = 0xD2
-_READ_FUNCTION: Final[int] = 0x03
 _EXCEPTION_FUNCTION: Final[int] = 0x83
 
 
@@ -58,12 +66,8 @@ def parse_enable_daly_full_readout(value: Any) -> bool:
     raise ValueError("enable_daly_full_readout must be a boolean true or false")
 
 
-def build_d2_read_frame(addr: int, count: int) -> bytes:
-    return DalyBMS._cmd_modbus(dev_id=_PROTOCOL_UNIT, fct=_READ_FUNCTION, addr=addr, count=count)
-
-
 def validate_d2_read_response(frame: bytes, *, addr: int, count: int) -> bytes:
-    if len(frame) < 5 or frame[0] != _PROTOCOL_UNIT:
+    if len(frame) < 5 or frame[0] != PROTOCOL_UNIT:
         raise ValueError("invalid D2 readout protocol unit")
 
     func = frame[1]
@@ -76,7 +80,7 @@ def validate_d2_read_response(frame: bytes, *, addr: int, count: int) -> bytes:
             "D2 readout Modbus exception 0x%02x for 0x%04x count %d"
             % (frame[2], addr, count)
         )
-    if func != _READ_FUNCTION:
+    if func != READ_FUNCTION:
         raise ValueError("invalid D2 readout function code")
 
     expected_data = count * 2
@@ -99,8 +103,15 @@ def _check_crc(frame: bytes) -> bool:
     return calc == expected
 
 
+def _accept_d2_read_notification(data: bytes) -> bool:
+    if len(data) < 5 or data[0] != PROTOCOL_UNIT or data[1] != READ_FUNCTION:
+        return False
+    expected_len = 3 + data[2] + 2
+    return len(data) == expected_len and _check_crc(data)
+
+
 class BMS(DalyBMS):
-    """aiobmsble Daly BMS with optional hourly read-only extended register map."""
+    """aiobmsble Daly BMS with optional extended register map and allowlisted writes."""
 
     def __init__(
         self,
@@ -115,6 +126,10 @@ class BMS(DalyBMS):
         self._readout_cache_until: float = 0.0
         self._diagnostic_readout: Optional[Mapping[str, Any]] = None
         self._decoded_settings: Optional[DecodedDalySettings] = None
+        self._wire_lock = asyncio.Lock()
+        self._operation_lock = asyncio.Lock()
+        self._expected_write_echo: Optional[bytes] = None
+        self._cached_blocks: Optional[tuple[tuple[int, bytes], ...]] = None
 
     @property
     def diagnostic_readout(self) -> Optional[Mapping[str, Any]]:
@@ -127,38 +142,104 @@ class BMS(DalyBMS):
     def _clear_readout_state(self) -> None:
         self._decoded_settings = None
         self._diagnostic_readout = None
+        self._cached_blocks = None
 
     def _notification_handler(
         self, _sender: BleakGATTCharacteristic, data: bytearray
     ) -> None:
-        unit = data[0] if len(data) >= 1 else 0
-        func = data[1] if len(data) >= 2 else 0
+        raw = bytes(data)
+        unit = raw[0] if len(raw) >= 1 else 0
+        func = raw[1] if len(raw) >= 2 else 0
         self._log.debug(
             "RX BLE data: len=%d unit=0x%02X function=0x%02X",
-            len(data),
+            len(raw),
             unit,
             func,
         )
 
-        if (
-            len(data) < DalyBMS._HEAD_LEN
-            or data[0:2] != DalyBMS._HEAD_READ
-            or data[2] + 1 != len(data) - len(DalyBMS._HEAD_READ) - DalyBMS._CRC_LEN
-        ):
+        if self._expected_write_echo is not None:
+            try:
+                validate_d2_write_echo(raw, expected_frame=self._expected_write_echo)
+            except ValueError:
+                self._log.debug("ignored non-matching write echo")
+                return
+            self._msg = raw
+            self._msg_event.set()
+            return
+
+        if not _accept_d2_read_notification(raw):
             self._log.debug("response data is invalid")
             return
 
-        if not self._check_integrity(
-            data,
-            crc_modbus,
-            slice(None, -2),
-            slice(-2, None),
-            "little",
-        ):
-            return
-
-        self._msg = bytes(data)
+        self._msg = raw
         self._msg_event.set()
+
+    async def _await_msg(self, data: bytes, char=None, wait_for_notify: bool = True, max_size: int = 0) -> None:
+        async with self._wire_lock:
+            await super()._await_msg(data, char, wait_for_notify, max_size)
+
+    async def fetch_settings_blocks(self, *, force: bool = False) -> tuple[tuple[int, bytes], ...]:
+        if not self._enable_daly_full_readout:
+            raise RuntimeError("daly full readout not enabled")
+        now = time.time()
+        if not force and self._cached_blocks and now < self._readout_cache_until:
+            return self._cached_blocks
+
+        self._clear_readout_state()
+        blocks: list[tuple[int, bytes]] = []
+        for block in READOUT_BLOCKS:
+            await self._await_msg(build_d2_read_frame(block.addr, block.count))
+            payload = validate_d2_read_response(self._msg, addr=block.addr, count=block.count)
+            blocks.append((block.addr, payload))
+        immutable_blocks = tuple((addr, bytes(data)) for addr, data in blocks)
+        self._decoded_settings = decode_daly_settings_blocks(immutable_blocks)
+        self._cached_blocks = immutable_blocks
+        register_count = sum(block.count for block in READOUT_BLOCKS)
+        covered = ",".join(
+            "0x%04X-0x%04X" % (block.addr, block.end_addr) for block in READOUT_BLOCKS
+        )
+        self._diagnostic_readout = MappingProxyType(
+            {
+                "protocol_unit": PROTOCOL_UNIT,
+                "covered_ranges": covered,
+                "register_count": register_count,
+            }
+        )
+        self._readout_cache_until = now + READOUT_CACHE_SECONDS
+        return immutable_blocks
+
+    async def write_field(self, field_key: str, value: Any) -> None:
+        field = WRITE_FIELDS_BY_KEY.get(field_key)
+        if field is None:
+            raise ValueError("unknown writable field %r" % field_key)
+        raw = encode_field(field, value)
+        frame = build_field_write_frame(field_key, raw)
+        async with self._wire_lock:
+            self._expected_write_echo = frame
+            try:
+                self._msg_event.clear()
+                await self._client.write_gatt_char(self.uuid_tx(), frame, response=False)
+                await asyncio.wait_for(self._msg_event.wait(), timeout=self.TIMEOUT)
+                validate_d2_write_echo(self._msg, expected_frame=frame)
+            finally:
+                self._expected_write_echo = None
+
+    async def restart_system(self) -> None:
+        frame = build_restart_write_frame()
+        async with self._wire_lock:
+            self._expected_write_echo = frame
+            try:
+                self._msg_event.clear()
+                await self._client.write_gatt_char(self.uuid_tx(), frame, response=False)
+                await asyncio.wait_for(self._msg_event.wait(), timeout=self.TIMEOUT)
+                validate_d2_write_echo(self._msg, expected_frame=frame)
+            finally:
+                self._expected_write_echo = None
+
+    async def reconnect(self) -> None:
+        async with self._wire_lock:
+            await self.disconnect(reset=True)
+            await self._connect()
 
     async def _maybe_full_readout(self) -> None:
         if not self._enable_daly_full_readout:
@@ -170,34 +251,17 @@ class BMS(DalyBMS):
         self._clear_readout_state()
 
         try:
-            blocks: list[tuple[int, bytes]] = []
-            for block in READOUT_BLOCKS:
-                await self._await_msg(build_d2_read_frame(block.addr, block.count))
-                payload = validate_d2_read_response(
-                    self._msg, addr=block.addr, count=block.count
-                )
-                blocks.append((block.addr, payload))
-
+            blocks = await self.fetch_settings_blocks(force=True)
             register_count = sum(block.count for block in READOUT_BLOCKS)
-            immutable_blocks = tuple((addr, bytes(data)) for addr, data in blocks)
             covered = ",".join(
                 "0x%04X-0x%04X" % (block.addr, block.end_addr) for block in READOUT_BLOCKS
             )
-            self._decoded_settings = decode_daly_settings_blocks(immutable_blocks)
-            self._diagnostic_readout = MappingProxyType(
-                {
-                    "protocol_unit": _PROTOCOL_UNIT,
-                    "covered_ranges": covered,
-                    "register_count": register_count,
-                }
-            )
             logger.info(
                 "Daly full readout unit=0x%02X ranges=%s registers=%d",
-                _PROTOCOL_UNIT,
+                PROTOCOL_UNIT,
                 covered,
                 register_count,
             )
-            self._readout_cache_until = now + READOUT_CACHE_SECONDS
         except asyncio.CancelledError:
             self._clear_readout_state()
             raise
@@ -207,6 +271,7 @@ class BMS(DalyBMS):
             self._readout_cache_until = now + READOUT_CACHE_SECONDS
 
     async def _async_update(self):
-        if self._enable_daly_full_readout:
-            await self._maybe_full_readout()
-        return await super()._async_update()
+        async with self._operation_lock:
+            if self._enable_daly_full_readout:
+                await self._maybe_full_readout()
+            return await super()._async_update()

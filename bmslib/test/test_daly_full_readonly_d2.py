@@ -52,13 +52,12 @@ def test_daly_full_ble_resolves_to_subclass_plugin():
     assert issubclass(DalyFullBMS, AiobmsbleDalyBMS)
 
 
-def test_daly_full_bms_module_has_no_write_or_raw_api():
-    src = inspect.getsource(daly_full_bms)
-    assert "_cmd_modbus" not in src.replace("DalyBMS._cmd_modbus", "")
-    for token in ("fct=0x06", "fct=6", "fct=0x10", "fct=16", "async_update(raw=True)"):
-        assert token not in src
+def test_daly_full_bms_module_has_allowlisted_write_only():
     assert not hasattr(daly_full_bms, "send_raw")
     assert not hasattr(daly_full_bms, "write_register")
+    assert not hasattr(daly_full_bms.BMS, "send_write_frame")
+    assert hasattr(daly_full_bms.BMS, "write_field")
+    assert hasattr(daly_full_bms.BMS, "restart_system")
 
 
 # --- exact boolean ---

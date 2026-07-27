@@ -51,6 +51,18 @@ INVERTER_MANUFACTURER: Final[dict[int, str]] = {
     65535: "--",
 }
 
+INVERTER_MANUFACTURER_WRITE: Final[dict[int, str]] = {
+    **{k: v for k, v in INVERTER_MANUFACTURER.items() if k != 65535},
+    19: "Sunsynk",
+    20: "MEGAREVO",
+    21: "Techfine",
+    22: "SCHNEIDER",
+    23: "YWTNBQ",
+}
+
+INVERTER_SELF_IDENTIFY_RAW: Final[int] = 255
+INVERTER_SELF_IDENTIFY_LABEL: Final[str] = "Self-Identification"
+
 FACTORY_PARAMETER_PASSWORD: Final[str] = "123456"
 
 # Registers excluded from MQTT/discovery (parameter password plaintext).
@@ -293,7 +305,14 @@ def decode_daly_settings_blocks(blocks: tuple[tuple[int, bytes], ...]) -> Decode
     if 0xD1 in regs:
         _add_enum(values, desc, "communication_method", "Communication Method", _reg(regs, 0xD1), COMMUNICATION_METHOD)
     if 0xD2 in regs:
-        _add_enum(values, desc, "inverter_manufacturer", "Inverter Manufacturer", _reg(regs, 0xD2), INVERTER_MANUFACTURER)
+        raw = _reg(regs, 0xD2)
+        if raw == INVERTER_SELF_IDENTIFY_RAW:
+            values["inverter_manufacturer"] = INVERTER_SELF_IDENTIFY_LABEL
+            desc.update(_extra_desc("inverter_manufacturer", name="Inverter Manufacturer", unit=None, state_class=None))
+        elif raw == 65535:
+            _add_enum(values, desc, "inverter_manufacturer", "Inverter Manufacturer", raw, INVERTER_MANUFACTURER)
+        else:
+            _add_enum(values, desc, "inverter_manufacturer", "Inverter Manufacturer", raw, INVERTER_MANUFACTURER_WRITE)
 
     _add_string(values, desc, "software_version", "Software Version", _ascii_field(regs, 0xA9, 7, reverse=True))
     _add_string(values, desc, "hardware_version", "Hardware Version", _ascii_field(regs, 0xB1, 7, reverse=False))

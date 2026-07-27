@@ -150,6 +150,8 @@ async def background_loop(timeout: float, sampler_list: List[BmsSampler]):
     while not shutdown:
 
         await mqtt_process_action_queue()
+        from bmslib.bms_ble.plugins.daly_full_mqtt_controls import mqtt_process_daly_action_queue
+        await mqtt_process_daly_action_queue()
         if not bg_checks(sampler_list, timeout, t_start):
             break
 

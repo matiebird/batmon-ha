@@ -66,6 +66,10 @@ class BMS():
         if self._type == 'daly_full_bms' and enable_daly_full_readout is not None:
             from bmslib.bms_ble.plugins.daly_full_bms import parse_enable_daly_full_readout
             self._enable_daly_full_readout = parse_enable_daly_full_readout(enable_daly_full_readout)
+        self._daly_staging = None
+        if self._type == 'daly_full_bms':
+            from bmslib.bms_ble.plugins.daly_full_staging import DalyStagingState
+            self._daly_staging = DalyStagingState()
         # Legacy kwargs (psk, verbose_log, probe, …) are accepted for API
         # compatibility with construct_bms but never forwarded to aiobmsble.
 
@@ -179,10 +183,74 @@ class BMS():
             await self.ble_bms.disconnect()
 
     async def set_switch(self, switch: str, state: bool):
-        # aiobmsble has no switch-write API — surface mosfet states as read-only.
+        if self._type == 'daly_full_bms':
+            raise NotImplementedError(
+                "set_switch is not supported for daly_full_bms; use DALY staged controls"
+            )
         raise NotImplementedError(
             "set_switch is not supported by the aiobmsble-backed adapter "
             "(switch=%r, type=%s)" % (switch, self._type))
+
+    @property
+    def daly_full_capable(self) -> bool:
+        return self._type == 'daly_full_bms'
+
+    @property
+    def daly_writable(self) -> bool:
+        return self.daly_full_capable and self._enable_daly_full_readout is True
+
+    @property
+    def daly_staging(self):
+        return self._daly_staging
+
+    def stage_daly_setting(self, key: str, value) -> None:
+        if not self.daly_writable or self._daly_staging is None:
+            raise RuntimeError("daly writable controls not enabled")
+        self._daly_staging.stage(key, value)
+
+    def discard_daly_pending(self) -> None:
+        if self._daly_staging is not None:
+            self._daly_staging.discard()
+
+    def arm_daly_advanced(self) -> None:
+        if self._daly_staging is not None:
+            self._daly_staging.arm_advanced()
+
+    async def apply_daly_pending(self):
+        from bmslib.bms_ble.plugins.daly_full_apply import apply_staged_settings
+        if not self.daly_writable or self._daly_staging is None or self.ble_bms is None:
+            raise RuntimeError("daly writable controls not enabled")
+        async with self.ble_bms._operation_lock:
+            return await apply_staged_settings(
+                self.ble_bms,
+                self._daly_staging,
+                device_id=self.address,
+            )
+
+    async def restart_daly_system(self):
+        from bmslib.bms_ble.plugins.daly_full_apply import restart_daly_system
+        if not self.daly_writable or self._daly_staging is None or self.ble_bms is None:
+            raise RuntimeError("daly writable controls not enabled")
+        async with self.ble_bms._operation_lock:
+            return await restart_daly_system(self.ble_bms, self._daly_staging)
+
+    async def restore_daly_settings(self):
+        from bmslib.bms_ble.plugins.daly_full_apply import restore_last_settings
+        if not self.daly_writable or self._daly_staging is None or self.ble_bms is None:
+            raise RuntimeError("daly writable controls not enabled")
+        async with self.ble_bms._operation_lock:
+            return await restore_last_settings(
+                self.ble_bms,
+                self._daly_staging,
+                device_id=self.address,
+            )
+
+    def current_daly_values(self) -> dict:
+        decoded = getattr(self.ble_bms, 'decoded_settings', None) if self.ble_bms else None
+        if decoded is None:
+            return {}
+        from bmslib.bms_ble.plugins.daly_full_apply import values_from_decoded
+        return values_from_decoded(decoded)
 
     async def fetch_device_info(self) -> DeviceInfo:
         di = await self.ble_bms.device_info()
@@ -240,6 +308,8 @@ class BMS():
             if decoded is not None:
                 extra_values = decoded.values
                 extra_desc = decoded.desc
+                if self._daly_staging is not None:
+                    self._daly_staging.update_current(self.current_daly_values())
             return BmsSample(
                 soc=sample.get('battery_level', math.nan),
                 soh=sample.get('battery_health', math.nan),
