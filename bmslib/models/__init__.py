@@ -121,6 +121,12 @@ def construct_bms(dev: dict, verbose_log: bool, bt_discovered_devices: list):
         if probe_spec:
             extra_kwargs['probe'] = probe_spec
 
+    if slug == 'daly_full_ble':
+        from bmslib.bms_ble.plugins.daly_full_bms import parse_enable_daly_full_readout
+        edfr = dev.get('enable_daly_full_readout')
+        if edfr is not None:
+            extra_kwargs['enable_daly_full_readout'] = parse_enable_daly_full_readout(edfr)
+
     bms_class = get_bms_model_class(slug)
 
     if bms_class is None:

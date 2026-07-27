@@ -86,6 +86,9 @@ schema:
       adapter: "str?"
       algorithm: "str?"
       current_calibration: "float?"
+      # Read-only discovery for `type: daly_full_ble` (aiobmsble Daly + extra D2
+      # block reads). No settings writes; leave false unless probing register map.
+      enable_daly_full_readout: "bool?"
       note: "str?"
 
   mqtt_user: "str?"

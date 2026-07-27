@@ -54,13 +54,20 @@ class BLEDeviceResolver:
 
 class BMS():
 
-    def __init__(self, address, type, blebms_class=None, keep_alive=False, adapter=None, name=None, **kwargs):
+    def __init__(self, address, type, blebms_class=None, keep_alive=False, adapter=None, name=None,
+                 enable_daly_full_readout=None, **kwargs):
         self.address = address
         self.adapter = adapter
         self.name = name
         self._type = type
         self._blebms_class = blebms_class
         self._keep_alive = keep_alive
+        self._enable_daly_full_readout = None
+        if self._type == 'daly_full_bms' and enable_daly_full_readout is not None:
+            from bmslib.bms_ble.plugins.daly_full_bms import parse_enable_daly_full_readout
+            self._enable_daly_full_readout = parse_enable_daly_full_readout(enable_daly_full_readout)
+        # Legacy kwargs (psk, verbose_log, probe, …) are accepted for API
+        # compatibility with construct_bms but never forwarded to aiobmsble.
 
         self._last_sample: Optional[BMSSample] = None
 
@@ -141,9 +148,13 @@ class BMS():
             self.ble_bms = None
 
         from aiobmsble.basebms import BaseBMS
+        plugin_kw = {}
+        if self._type == 'daly_full_bms' and self._enable_daly_full_readout is not None:
+            plugin_kw['enable_daly_full_readout'] = self._enable_daly_full_readout
         self.ble_bms: BaseBMS = self._blebms_class(
             ble_device=ble_device,
             keep_alive=self._keep_alive,
+            **plugin_kw,
         )
 
         # try:
