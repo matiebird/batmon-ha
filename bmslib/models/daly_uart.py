@@ -97,6 +97,13 @@ class DalyUart(DalyBt):
     BAUDRATE = 9600
 
     def __init__(self, address, **kwargs):
+        ap = kwargs.get('enable_daly_android_protocol_probe')
+        if ap is not None:
+            from bmslib.models.daly_android_probe import parse_enable_daly_android_protocol_probe
+            parse_enable_daly_android_protocol_probe(ap)
+            if ap:
+                raise ValueError(
+                    "enable_daly_android_protocol_probe requires BLE type: daly, not daly_uart")
         super().__init__(address, **kwargs)
         self._uart_buf = bytearray()
 

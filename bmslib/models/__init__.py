@@ -128,6 +128,13 @@ def construct_bms(dev: dict, verbose_log: bool, bt_discovered_devices: list):
             if parse_enable_daly_diagnostics(eda):
                 extra_kwargs['enable_daly_diagnostics'] = True
 
+    if slug == 'daly':
+        eap = dev.get('enable_daly_android_protocol_probe')
+        if eap is not None:
+            from bmslib.models.daly_android_probe import parse_enable_daly_android_protocol_probe
+            if parse_enable_daly_android_protocol_probe(eap):
+                extra_kwargs['enable_daly_android_protocol_probe'] = True
+
     bms_class = get_bms_model_class(slug)
 
     if bms_class is None:

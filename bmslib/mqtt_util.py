@@ -289,6 +289,23 @@ sample_desc = {
         "entity_category": "diagnostic",
         "icon": "memory",
     },
+    "bms/android_protocol_unit": {
+        "field": "android_protocol_unit",
+        "device_class": None,
+        "state_class": None,
+        "unit_of_measurement": None,
+        "string_field": True,
+        "entity_category": "diagnostic",
+        "icon": "cellphone-link",
+    },
+    "bms/android_protocol_voltage": {
+        "field": "android_protocol_voltage",
+        "device_class": "voltage",
+        "state_class": "measurement",
+        "unit_of_measurement": "V",
+        "precision": 2,
+        "entity_category": "diagnostic",
+    },
 }
 
 

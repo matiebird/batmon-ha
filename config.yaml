@@ -88,6 +88,7 @@ schema:
       current_calibration: "float?"
       note: "str?"
       enable_daly_diagnostics: "bool?"
+      enable_daly_android_protocol_probe: "bool?"
 
   mqtt_user: "str?"
   mqtt_password: "str?"

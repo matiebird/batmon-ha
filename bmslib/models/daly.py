@@ -24,6 +24,17 @@ from typing import Dict, Optional
 from bmslib.bms import BmsSample
 from bmslib.bt import BtBms, enumerate_services
 from bmslib.cache.mem import mem_cache_deco
+from bmslib.models.daly_android_probe import (
+    android_probe_request_bytes,
+    drain_a5_notify_buf,
+    DalyAndroidProbeUnsupported,
+    MAX_A5_RX_BUF,
+    ModbusProbeMalformed,
+    modbus_probe_future_key,
+    parse_android_probe_response,
+    parse_enable_daly_android_protocol_probe,
+    try_extract_modbus_probe_frame,
+)
 
 
 def calc_crc(message_bytes):
@@ -156,6 +167,8 @@ class DalyBt(BtBms):
     def __init__(self, address, **kwargs):
         self.enable_daly_diagnostics = parse_enable_daly_diagnostics(
             kwargs.pop("enable_daly_diagnostics", False))
+        self.enable_daly_android_protocol_probe = parse_enable_daly_android_protocol_probe(
+            kwargs.pop("enable_daly_android_protocol_probe", False))
         pin = kwargs.get('pin')
         super().__init__(address, **kwargs)
         if pin:
@@ -168,6 +181,11 @@ class DalyBt(BtBms):
         self._last_response = None
         self._diag_cache: Dict[str, tuple] = {}
         self._diag_logged: set = set()
+        self._wire_lock = asyncio.Lock()
+        self._a5_rx_buf = bytearray()
+        self._modbus_rx_buf = bytearray()
+        self._modbus_pending: Optional[dict] = None
+        self._modbus_probe_malformed = False
 
     async def get_states_cached(self, key):
         if not self._states:
@@ -175,45 +193,69 @@ class DalyBt(BtBms):
             self.logger.debug('got daly states: %s', self._states)
         return self._states.get(key)
 
+    def _a5_notify_crc_valid(self, frame: bytes) -> bool:
+        if len(frame) != 13 or frame[0] != 0xA5:
+            return False
+        return calc_crc(frame[:12]) == frame[12]
+
+    def _on_modbus_probe_frame(self, frame: bytes):
+        if self._modbus_pending is not None:
+            self._fetch_futures.set_result(self._modbus_pending['key'], frame)
+
+    def _feed_modbus_probe_bytes(self):
+        unit = self._modbus_pending['unit']
+        try:
+            frame = try_extract_modbus_probe_frame(self._modbus_rx_buf, unit)
+        except ModbusProbeMalformed:
+            self._modbus_probe_malformed = True
+            self._modbus_rx_buf.clear()
+            return
+        if frame is not None:
+            if self._modbus_rx_buf:
+                self._modbus_probe_malformed = True
+                self._modbus_rx_buf.clear()
+                return
+            self._on_modbus_probe_frame(frame)
+
+    def _drain_a5_notify_buf(self):
+        drain_a5_notify_buf(
+            self._a5_rx_buf,
+            self._a5_notify_crc_valid,
+            self._handle_a5_notify_frame,
+            max_buf=MAX_A5_RX_BUF,
+        )
+
     def _notification_callback(self, _sender, data):
-        RESP_LEN = 13
+        if self._modbus_pending is not None:
+            self._modbus_rx_buf.extend(data)
+            self._feed_modbus_probe_bytes()
+            return
 
-        # split responses into chunks with length RESP_LEN
-        responses = [data[i:i + RESP_LEN] for i in range(0, len(data), RESP_LEN)]
+        self._a5_rx_buf.extend(data)
+        self._drain_a5_notify_buf()
 
-        for response_bytes in responses:
-            self.logger.debug('daly resp: %s', response_bytes)
+    def _handle_a5_notify_frame(self, frame: bytes):
+        self.logger.debug('daly resp: %s', frame)
 
-            if len(response_bytes) < RESP_LEN:
-                self.logger.warning("msg too short: %s", response_bytes)
-                continue
+        command = frame[2]
+        response_bytes = frame[4:-1]
 
-            check_comp = calc_crc(response_bytes[0:12])
-            check_expect = response_bytes[12]
+        # buffer for multi-response commands
+        buf = self._fetch_nr.get(command, None)
+        if buf:
+            try:
+                i = buf.index(None)
+                buf[i] = response_bytes
+                if i + 1 == len(buf):  # last item?
+                    response_bytes = buf
+                else:
+                    return
+            except ValueError:
+                # this happens if buf is already full and still receiving messages
+                return
 
-            command = response_bytes[2]
-            response_bytes = response_bytes[4:-1]
-
-            if check_comp != check_expect:
-                self.logger.warning("checksum fail, expected %s, got %s. %s", check_expect, check_comp, response_bytes)
-                continue
-
-            # buffer for multi-response commands
-            buf = self._fetch_nr.get(command, None)
-            if buf:
-                try:
-                    i = buf.index(None)
-                    buf[i] = response_bytes
-                    if i + 1 == len(buf):  # last item?
-                        response_bytes = buf
-                    else:
-                        continue
-                except ValueError:
-                    # this happens if buf is already full and still receiving messages
-                    continue
-
-            self._last_response = response_bytes
-            self._fetch_futures.set_result(command, response_bytes)
+        self._last_response = response_bytes
+        self._fetch_futures.set_result(command, response_bytes)
 
     async def connect(self, timeout=10, **kwargs):
         try:
@@ -260,24 +302,29 @@ class DalyBt(BtBms):
         await super().disconnect()
 
     async def _q(self, command: int, num_responses: int = 1):
-        msg = daly_command_message(command, address=self.WIRE_ADDRESS)
-        if num_responses > 1:
-            self._fetch_nr[command] = [None] * num_responses
-        else:
-            self._fetch_nr.pop(command, None)
+        async with self._wire_lock:
+            msg = daly_command_message(command, address=self.WIRE_ADDRESS)
+            if num_responses > 1:
+                self._fetch_nr[command] = [None] * num_responses
+            else:
+                self._fetch_nr.pop(command, None)
 
-        with await self._fetch_futures.acquire_timeout(command, timeout=self.TIMEOUT / 2):
-            self.logger.debug("daly send: %s", msg)
+            with await self._fetch_futures.acquire_timeout(command, timeout=self.TIMEOUT / 2):
+                self.logger.debug("daly send: %s", msg)
+                await self.client.write_gatt_char(self.UUID_TX, msg)
+
+                try:
+                    sample = await self._fetch_futures.wait_for(command, self.TIMEOUT)
+                except TimeoutError:
+                    n_recv = num_responses - self._fetch_nr.get(command, [None]).count(None)
+                    raise TimeoutError(
+                        "timeout awaiting result for cmd=0x%02x, got %d/%d responses" % (command, n_recv, num_responses))
+
+                return sample
+
+    async def _wire_write(self, msg: bytes):
+        async with self._wire_lock:
             await self.client.write_gatt_char(self.UUID_TX, msg)
-
-            try:
-                sample = await self._fetch_futures.wait_for(command, self.TIMEOUT)
-            except TimeoutError:
-                n_recv = num_responses - self._fetch_nr.get(command, [None]).count(None)
-                raise TimeoutError(
-                    "timeout awaiting result for cmd=0x%02x, got %d/%d responses" % (command, n_recv, num_responses))
-
-            return sample
 
     async def set_switch(self, switch: str, state: bool):
         fet_addr = dict(discharge=0xD9, charge=0xDA)
@@ -285,7 +332,7 @@ class DalyBt(BtBms):
         self.logger.info('write %s', msg)
         self._fetch_status.invalidate(self)
         status = await self._fetch_status()
-        await self.client.write_gatt_char(self.UUID_TX, msg)
+        await self._wire_write(msg)
 
         #if switch == "charge" and state != status['discharging_mosfet']:
         #   msg = daly_command_message(fet_addr["discharge"], extra="01" if status['discharging_mosfet'] else "00")
@@ -294,7 +341,12 @@ class DalyBt(BtBms):
     async def fetch(self) -> BmsSample:
         diagnostics = {}
         if self.enable_daly_diagnostics:
-            diagnostics = await self._gather_settings_diagnostics()
+            diagnostics.update(await self._gather_settings_diagnostics())
+        if self.enable_daly_android_protocol_probe:
+            probe = await self._run_cached_diagnostic(
+                "android_protocol_probe", self._probe_android_protocol)
+            if probe:
+                diagnostics.update(probe)
 
         status = await self._fetch_status()
 
@@ -360,6 +412,63 @@ class DalyBt(BtBms):
     def _apply_gathered_diagnostics(self, sample: BmsSample, diagnostics: dict):
         for key, value in diagnostics.items():
             setattr(sample, key, value)
+
+    async def _android_probe_wait_for_response(self, key: str, timeout: float) -> bytes:
+        """Await probe response without FuturesPool converting CancelledError."""
+        fut = self._fetch_futures._futures.get(key)
+        if fut is None:
+            raise KeyError('future %s not found' % key)
+        try:
+            return await asyncio.wait_for(fut, timeout)
+        except asyncio.CancelledError:
+            raise
+        except asyncio.TimeoutError:
+            raise TimeoutError("timeout waiting for %s" % key)
+        finally:
+            self._fetch_futures.remove(key)
+
+    async def _android_probe_unit_exchange(self, unit: int) -> bytes:
+        key = modbus_probe_future_key(unit)
+        request = android_probe_request_bytes(unit)
+        async with self._wire_lock:
+            self._modbus_rx_buf = bytearray()
+            self._modbus_probe_malformed = False
+            self._modbus_pending = {'unit': unit, 'key': key}
+            try:
+                with await self._fetch_futures.acquire_timeout(key, timeout=self.TIMEOUT / 2):
+                    self.logger.debug("daly android probe send unit=0x%02x: %s", unit, request)
+                    await self.client.write_gatt_char(self.UUID_TX, request)
+                    return await self._android_probe_wait_for_response(key, self.TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except TimeoutError:
+                if self._modbus_probe_malformed or self._modbus_rx_buf:
+                    raise ValueError(
+                        "Daly Android probe incomplete or malformed response for unit=0x%02x" % unit)
+                raise TimeoutError("timeout awaiting modbus probe unit=0x%02x" % unit)
+            finally:
+                self._modbus_pending = None
+                self._modbus_rx_buf.clear()
+
+    async def _probe_android_protocol(self) -> dict:
+        try:
+            frame = await self._android_probe_unit_exchange(0x81)
+            parsed = parse_android_probe_response(frame, 0x81)
+            return {
+                "android_protocol_unit": "81",
+                **parsed,
+            }
+        except (TimeoutError, DalyAndroidProbeUnsupported):
+            pass
+        except asyncio.CancelledError:
+            raise
+
+        frame = await self._android_probe_unit_exchange(0xD2)
+        parsed = parse_android_probe_response(frame, 0xD2)
+        return {
+            "android_protocol_unit": "D2",
+            **parsed,
+        }
 
     async def fetch_rated_parameters(self) -> dict:
         response_data = await self._q(0x50)

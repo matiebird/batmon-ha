@@ -51,7 +51,9 @@ class BmsSample:
                  nominal_cell_voltage: float = math.nan,
                  production_date: Optional[str] = None,
                  software_version: Optional[str] = None,
-                 hardware_version: Optional[str] = None):
+                 hardware_version: Optional[str] = None,
+                 android_protocol_unit: Optional[str] = None,
+                 android_protocol_voltage: float = math.nan):
         """
 
         :param voltage:
@@ -133,6 +135,8 @@ class BmsSample:
         self.production_date: Optional[str] = production_date
         self.software_version: Optional[str] = software_version
         self.hardware_version: Optional[str] = hardware_version
+        self.android_protocol_unit: Optional[str] = android_protocol_unit
+        self.android_protocol_voltage: float = android_protocol_voltage
 
         self.num_samples = 0
 
