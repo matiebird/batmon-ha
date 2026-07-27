@@ -40,25 +40,30 @@ from bmslib.bms_ble.plugins.daly_full_decode import (
     decode_daly_settings_blocks,
 )
 from bmslib.bms_ble.plugins.daly_full_bms import BMS as DalyFullBMS
-from bmslib.bms_ble.plugins.daly_full_write_registry import (
-    HIBERNATE_SPECIAL_RAW,
-    WRITE_FIELDS,
-    WRITE_FIELDS_BY_KEY,
-    build_write_plan,
-    encode_field,
-    validate_cross_fields,
-    validate_prospective_configuration,
-)
 from bmslib.bms_ble.plugins.daly_full_mqtt_controls import (
     ACTION_APPLY,
     ACTION_DISCARD,
     build_daly_full_discovery,
     enqueue_daly_action,
     mqtt_process_daly_action_queue,
+    publish_daly_full_state,
     publish_daly_full_tombstones,
     writable_discovery_config_topics,
     _daly_action_callbacks,
     _daly_message_queue,
+)
+from bmslib.bms_ble.plugins.daly_full_write_registry import (
+    CHARGE_CURRENT_ALARM_MAX_A,
+    DISCHARGE_CURRENT_ALARM_MAX_A,
+    HIBERNATE_SPECIAL_RAW,
+    TEMPERATURE_ALARM_MIN_C,
+    TEMPERATURE_ALARM_MAX_C,
+    WRITE_FIELDS,
+    WRITE_FIELDS_BY_KEY,
+    build_write_plan,
+    encode_field,
+    validate_cross_fields,
+    validate_prospective_configuration,
 )
 from bmslib.test.test_daly_full_decode import build_fixture_blocks, _set_u16
 
@@ -756,3 +761,53 @@ def test_tier3_write_disarms_after_attempt(tmp_path, monkeypatch):
     assert result.ok
     assert wire.writes
     assert not staging.is_armed(1000.0)
+
+
+def test_live_alarm_values_encode_and_discovery_ranges():
+    charge_field = WRITE_FIELDS_BY_KEY["charge_current_high_level_1_alarm_a"]
+    discharge_field = WRITE_FIELDS_BY_KEY["discharge_current_high_level_2_alarm_a"]
+    temp_field = WRITE_FIELDS_BY_KEY["charge_temperature_low_level_2_alarm_c"]
+
+    assert encode_field(charge_field, 360) == 30000 - 3600
+    assert encode_field(discharge_field, 450) == 30000 + 4500
+    assert encode_field(temp_field, -35) == 5
+
+    discovery = build_daly_full_discovery("farm/bms1", {"identifiers": ["farm/bms1"]}, 60)
+    node = "farm_bms1"
+    charge_topic = "homeassistant/number/%s/daly_charge_current_high_level_1_alarm_a/config" % node
+    discharge_topic = "homeassistant/number/%s/daly_discharge_current_high_level_2_alarm_a/config" % node
+    temp_topic = "homeassistant/number/%s/daly_charge_temperature_low_level_2_alarm_c/config" % node
+
+    charge_cfg = discovery[charge_topic]
+    discharge_cfg = discovery[discharge_topic]
+    temp_cfg = discovery[temp_topic]
+    assert charge_cfg["min"] == 0
+    assert charge_cfg["max"] == CHARGE_CURRENT_ALARM_MAX_A
+    assert charge_cfg["step"] == 0.1
+    assert discharge_cfg["max"] == DISCHARGE_CURRENT_ALARM_MAX_A
+    assert temp_cfg["min"] == TEMPERATURE_ALARM_MIN_C
+    assert temp_cfg["max"] == TEMPERATURE_ALARM_MAX_C
+
+
+def test_live_alarm_values_publish_number_states():
+    mqtt = MagicMock()
+    mock_info = MagicMock()
+    mock_info.rc = 0
+    published: dict[str, str] = {}
+
+    def _publish(topic, data, retain=False):
+        published[topic] = data
+        return mock_info
+
+    mqtt.publish = _publish
+    staging = DalyStagingState(
+        current={
+            "charge_current_high_level_1_alarm_a": 360.0,
+            "discharge_current_high_level_2_alarm_a": 450.0,
+            "charge_temperature_low_level_2_alarm_c": -35.0,
+        }
+    )
+    publish_daly_full_state(mqtt, "farm/bms1", staging, staging.current)
+    assert published["farm/bms1/daly_write/charge_current_high_level_1_alarm_a/state"] == "360.0"
+    assert published["farm/bms1/daly_write/discharge_current_high_level_2_alarm_a/state"] == "450.0"
+    assert published["farm/bms1/daly_write/charge_temperature_low_level_2_alarm_c/state"] == "-35.0"

@@ -19,6 +19,10 @@ from bmslib.bms_ble.plugins.daly_full_decode import (
 HIBERNATE_SPECIAL_RAW: Final[int] = 65535
 RESTART_ADDRESS: Final[int] = 0x00F0
 RESTART_FIELD_KEY: Final[str] = "system_restart"
+CHARGE_CURRENT_ALARM_MAX_A: Final[float] = 3000.0
+DISCHARGE_CURRENT_ALARM_MAX_A: Final[float] = 3553.5
+TEMPERATURE_ALARM_MIN_C: Final[float] = -40.0
+TEMPERATURE_ALARM_MAX_C: Final[float] = 125.0
 
 
 class EntityType(str, Enum):
@@ -93,10 +97,26 @@ def _encode_u16_identity(value: Any) -> int:
     return raw
 
 
-def _validate_nonneg_alarm_current(value: Any) -> None:
+def _validate_charge_current_alarm(value: Any) -> None:
     v = _reject_non_numeric(value)
     if v < 0:
-        raise ValueError("current alarm must be >= 0")
+        raise ValueError("charge current must be >= 0")
+    if v > CHARGE_CURRENT_ALARM_MAX_A:
+        raise ValueError("charge current out of range")
+
+
+def _validate_discharge_current_alarm(value: Any) -> None:
+    v = _reject_non_numeric(value)
+    if v < 0:
+        raise ValueError("discharge current must be >= 0")
+    if v > DISCHARGE_CURRENT_ALARM_MAX_A:
+        raise ValueError("discharge current out of range")
+
+
+def _validate_temperature_alarm(value: Any) -> None:
+    v = _reject_non_numeric(value)
+    if not (TEMPERATURE_ALARM_MIN_C <= v <= TEMPERATURE_ALARM_MAX_C):
+        raise ValueError("temperature alarm must be -40..125 C")
 
 
 def _encode_charge_current(value: Any) -> int:
@@ -263,25 +283,32 @@ WRITE_FIELDS: Final[tuple[DalyWriteField, ...]] = (
                    encode=_encode_u16_div10, validate=_validate_total_voltage),
     DalyWriteField("D2-CHG-I-L1", "charge_current_high_level_1_alarm_a", 0x0093, EntityType.NUMBER, 2,
                    "charge_current_high_level_1_alarm_a", "VoltageSettingFragment.java:1224-1251", "A", 1,
-                   encode=_encode_charge_current, validate=_validate_nonneg_alarm_current),
+                   encode=_encode_charge_current, validate=_validate_charge_current_alarm,
+                   min_value=0, max_value=CHARGE_CURRENT_ALARM_MAX_A),
     DalyWriteField("D2-CHG-I-L2", "charge_current_high_level_2_alarm_a", 0x0094, EntityType.NUMBER, 2,
                    "charge_current_high_level_2_alarm_a", "VoltageSettingFragment.java:1253-1316", "A", 1,
-                   encode=_encode_charge_current, validate=_validate_nonneg_alarm_current),
+                   encode=_encode_charge_current, validate=_validate_charge_current_alarm,
+                   min_value=0, max_value=CHARGE_CURRENT_ALARM_MAX_A),
     DalyWriteField("D2-DCHG-I-L2", "discharge_current_high_level_2_alarm_a", 0x0096, EntityType.NUMBER, 2,
                    "discharge_current_high_level_2_alarm_a", "VoltageSettingFragment.java:1386-1397", "A", 1,
-                   encode=_encode_discharge_current, validate=_validate_nonneg_alarm_current),
+                   encode=_encode_discharge_current, validate=_validate_discharge_current_alarm,
+                   min_value=0, max_value=DISCHARGE_CURRENT_ALARM_MAX_A),
     DalyWriteField("D2-CHG-T-HI", "charge_temperature_high_level_2_alarm_c", 0x0098, EntityType.NUMBER, 2,
                    "charge_temperature_high_level_2_alarm_c", "TemperatureSettingFragment.java:953-964", "°C", 1,
-                   encode=_encode_temp_bias),
+                   encode=_encode_temp_bias, validate=_validate_temperature_alarm,
+                   min_value=TEMPERATURE_ALARM_MIN_C, max_value=TEMPERATURE_ALARM_MAX_C),
     DalyWriteField("D2-CHG-T-LO", "charge_temperature_low_level_2_alarm_c", 0x009A, EntityType.NUMBER, 2,
                    "charge_temperature_low_level_2_alarm_c", "TemperatureSettingFragment.java:826-885", "°C", 1,
-                   encode=_encode_temp_bias),
+                   encode=_encode_temp_bias, validate=_validate_temperature_alarm,
+                   min_value=TEMPERATURE_ALARM_MIN_C, max_value=TEMPERATURE_ALARM_MAX_C),
     DalyWriteField("D2-DCHG-T-HI", "discharge_temperature_high_level_2_alarm_c", 0x009C, EntityType.NUMBER, 2,
                    "discharge_temperature_high_level_2_alarm_c", "TemperatureSettingFragment.java:755-823", "°C", 1,
-                   encode=_encode_temp_bias),
+                   encode=_encode_temp_bias, validate=_validate_temperature_alarm,
+                   min_value=TEMPERATURE_ALARM_MIN_C, max_value=TEMPERATURE_ALARM_MAX_C),
     DalyWriteField("D2-DCHG-T-LO", "discharge_temperature_low_level_2_alarm_c", 0x009E, EntityType.NUMBER, 2,
                    "discharge_temperature_low_level_2_alarm_c", "TemperatureSettingFragment.java:684-752", "°C", 1,
-                   encode=_encode_temp_bias),
+                   encode=_encode_temp_bias, validate=_validate_temperature_alarm,
+                   min_value=TEMPERATURE_ALARM_MIN_C, max_value=TEMPERATURE_ALARM_MAX_C),
     DalyWriteField("D2-V-DIFF", "cell_voltage_difference_level_2_alarm_v", 0x00A0, EntityType.NUMBER, 2,
                    "cell_voltage_difference_level_2_alarm_v", "VoltageSettingFragment.java:1140-1221", "V", 3,
                    encode=_encode_u16_div1000, validate=_validate_cell_voltage),

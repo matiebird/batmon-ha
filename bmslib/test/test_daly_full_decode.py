@@ -439,7 +439,11 @@ def test_daly_full_mos_discovery_read_only_no_command_topic():
     assert "command_topic" not in blob
     assert config_msgs["homeassistant/switch/farm/charge/config"] == ("", True)
     assert config_msgs["homeassistant/switch/farm/discharge/config"] == ("", True)
-    assert "homeassistant/binary_sensor/farm/charge_state/config" in config_msgs
+    assert config_msgs["homeassistant/binary_sensor/farm/charge_state/config"] == ("", True)
+    assert config_msgs["homeassistant/binary_sensor/farm/discharge_state/config"] == ("", True)
+    charge_cfg = json.loads(config_msgs["homeassistant/binary_sensor/farm/charge/config"][0])
+    assert charge_cfg["unique_id"] == "farm__switch_charge"
+    assert "command_topic" not in charge_cfg
 
 
 def test_daly_ble_mos_discovery_retains_command_topic():
@@ -535,7 +539,11 @@ def test_writable_to_readonly_switch_transition_tombstones_and_skips_subscribe()
     node = device_topic.replace("/", "_")
     assert readonly_msgs[f"homeassistant/switch/{node}/charge/config"] == ("", True)
     assert readonly_msgs[f"homeassistant/switch/{node}/discharge/config"] == ("", True)
-    assert f"homeassistant/binary_sensor/{node}/charge_state/config" in readonly_msgs
+    assert readonly_msgs[f"homeassistant/binary_sensor/{node}/charge_state/config"] == ("", True)
+    assert readonly_msgs[f"homeassistant/binary_sensor/{node}/discharge_state/config"] == ("", True)
+    charge_cfg = json.loads(readonly_msgs[f"homeassistant/binary_sensor/{node}/charge/config"][0])
+    assert charge_cfg["unique_id"] == f"{device_topic}__switch_charge"
+    assert "command_topic" not in charge_cfg
     assert "command_topic" not in json.dumps(
         [d for d, _ in readonly_msgs.values() if isinstance(d, str)]
     )

@@ -561,11 +561,11 @@ def publish_hass_discovery(client, device_topic, expire_after_seconds: int, samp
                 }
             else:
                 switch_tombstones.append(f"homeassistant/switch/{node_id}/{switch_name}/config")
-                discovery_msg[f"homeassistant/binary_sensor/{node_id}/{switch_name}_state/config"] = {
-                    "unique_id": f"{device_topic}__switch_{switch_name}_readonly",
+                switch_tombstones.append(f"homeassistant/binary_sensor/{node_id}/{switch_name}_state/config")
+                discovery_msg[f"homeassistant/binary_sensor/{node_id}/{switch_name}/config"] = {
+                    "unique_id": f"{device_topic}__switch_{switch_name}",
                     "name": f"{switch_name} switch",
                     "device_class": 'power',
-                    "entity_category": "diagnostic",
                     "expire_after": expire_after_seconds,
                     "device": device_json,
                     "state_topic": f"{device_topic}/switch/{switch_name}",
