@@ -58,11 +58,17 @@ jobs:
         with:
           context: .
           push: false
+          load: true
+          tags: batmon-ha:validate-addon
           platforms: linux/amd64
           build-args: |
             BUILD_FROM=ghcr.io/home-assistant/amd64-base:latest
           cache-from: type=gha,scope=addon-amd64
           cache-to: type=gha,mode=max,scope=addon-amd64
+      - name: Smoke-test aiobmsble in main venv
+        run: |
+          docker run --rm batmon-ha:validate-addon venv/bin/python -c \
+            "from importlib.metadata import version; import aiobmsble; assert version('aiobmsble') == '0.25.0', version('aiobmsble')"
 
   # One job per platform so arm64/armv7 (QEMU-emulated, and this Dockerfile
   # builds four venvs with several git+https installs) run in parallel rather

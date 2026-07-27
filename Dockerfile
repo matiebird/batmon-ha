@@ -31,7 +31,8 @@ RUN venv/bin/pip3 install influxdb || true
 # #275. A plain install silently upgraded bleak to 3.0.2 (#383), so install it
 # pinned and with --no-deps to keep the pin. aiobmsble imports no bleak-3-only
 # API; its other runtime dep, bleak-retry-connector, is in requirements.txt.
-RUN venv/bin/pip3 install --no-deps 'aiobmsble==0.25.0' || true
+RUN venv/bin/pip3 install --no-deps 'aiobmsble==0.25.0'
+RUN venv/bin/python -c "from importlib.metadata import version; import aiobmsble; assert version('aiobmsble') == '0.25.0', version('aiobmsble')"
 # bumble-bleak: bleak-compatible BLE stack without BlueZ/D-Bus. Installed only in
 # the main `venv` (NOT venv_bleak_pairing, which keeps forked bleak for PSK
 # pairing). Activation is opt-in at runtime: addon_main.sh prepends the shadow
