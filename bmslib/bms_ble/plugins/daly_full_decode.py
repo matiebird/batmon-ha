@@ -297,11 +297,11 @@ def decode_daly_settings_blocks(blocks: tuple[tuple[int, bytes], ...]) -> Decode
     if 0x89 in regs:
         _add_enum(values, desc, "battery_chemistry", "Battery Chemistry", _reg(regs, 0x89), BATTERY_CHEMISTRY)
     if 0xA5 in regs:
-        _add_enum(values, desc, "charge_mos_switch_control", "Charge MOS Switch Control", _reg(regs, 0xA5), MOS_SWITCH)
+        _add_enum(values, desc, "charge_mos_switch_control", "Charge MOS", _reg(regs, 0xA5), MOS_SWITCH)
     if 0xA6 in regs:
-        _add_enum(values, desc, "discharge_mos_switch_control", "Discharge MOS Switch Control", _reg(regs, 0xA6), MOS_SWITCH)
+        _add_enum(values, desc, "discharge_mos_switch_control", "Discharge MOS", _reg(regs, 0xA6), MOS_SWITCH)
     if 0xCF in regs:
-        _add_enum(values, desc, "active_balance_switch", "Active Balance Switch", _reg(regs, 0xCF), ACTIVE_BALANCE_SWITCH)
+        _add_enum(values, desc, "active_balance_switch", "Active Balance", _reg(regs, 0xCF), ACTIVE_BALANCE_SWITCH)
     if 0xD1 in regs:
         _add_enum(values, desc, "communication_method", "Communication Method", _reg(regs, 0xD1), COMMUNICATION_METHOD)
     if 0xD2 in regs:

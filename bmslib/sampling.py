@@ -22,6 +22,7 @@ from bmslib.bms_ble.plugins.daly_full_mqtt_controls import (
     ACTION_APPLY,
     ACTION_ARM,
     ACTION_DISCARD,
+    ACTION_FORCE_START,
     ACTION_RESTART,
     ACTION_RESTORE,
     publish_daly_full_discovery,
@@ -572,12 +573,17 @@ class BmsSampler:
             logger.info('%s restart DALY BMS', bms.name)
             await bms.restart_daly_system()
 
+        async def _force_start(_payload: str):
+            logger.info('%s force start DALY BMS', bms.name)
+            await bms.trigger_force_start()
+
         handlers = {
             ACTION_APPLY: _apply,
             ACTION_DISCARD: _discard,
             ACTION_RESTORE: _restore,
             ACTION_ARM: _arm,
             ACTION_RESTART: _restart,
+            ACTION_FORCE_START: _force_start,
         }
 
         for key, field in WRITE_FIELDS_BY_KEY.items():

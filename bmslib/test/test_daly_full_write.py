@@ -16,8 +16,10 @@ from bmslib.bms_ble.plugins.daly_full_backup import (
     save_backup,
 )
 from bmslib.bms_ble.plugins.daly_full_protocol import (
+    PROTOCOL_UNIT_81,
+    PROTOCOL_UNIT_D2,
     WRITE_FRAME_LEN,
-    assert_allowlisted_write_address,
+    assert_allowlisted_write,
     assert_valid_registry_write_frame,
     assert_valid_restart_write_frame,
     build_d2_write_frame,
@@ -26,12 +28,14 @@ from bmslib.bms_ble.plugins.daly_full_protocol import (
     check_crc,
     modbus_crc_append,
     validate_d2_write_echo,
+    validate_write_echo,
 )
 from bmslib.bms_ble.plugins.daly_full_staging import DalyStagingState, ARM_EXPIRY_SECONDS
 from bmslib.bms_ble.plugins.daly_full_apply import (
     apply_staged_settings,
     restart_daly_system,
     restore_last_settings,
+    trigger_force_start,
     values_from_decoded,
 )
 from bmslib.bms_ble.plugins.daly_full_decode import (
@@ -55,6 +59,8 @@ from bmslib.bms_ble.plugins.daly_full_mqtt_controls import (
 from bmslib.bms_ble.plugins.daly_full_write_registry import (
     CHARGE_CURRENT_ALARM_MAX_A,
     DISCHARGE_CURRENT_ALARM_MAX_A,
+    FORCE_START_FIELD_KEY,
+    FORCE_START_UNSUPPORTED_RAW,
     HIBERNATE_SPECIAL_RAW,
     TEMPERATURE_ALARM_MIN_C,
     TEMPERATURE_ALARM_MAX_C,
@@ -62,6 +68,7 @@ from bmslib.bms_ble.plugins.daly_full_write_registry import (
     WRITE_FIELDS_BY_KEY,
     build_write_plan,
     encode_field,
+    readback_register_address,
     validate_cross_fields,
     validate_prospective_configuration,
 )
@@ -85,6 +92,11 @@ def test_write_crc_is_low_byte_first():
 def test_yc_factory_address_rejected():
     with pytest.raises(ValueError, match="excluded"):
         build_d2_write_frame(0x0580, 1)
+
+
+def test_protocol_81_disallowed_address_rejected():
+    with pytest.raises(ValueError, match="not allowlisted"):
+        assert_allowlisted_write(PROTOCOL_UNIT_81, 0x0122)
 
 
 def test_bms_has_no_public_raw_write_api():
@@ -158,9 +170,9 @@ class _FakeDalyWire:
     async def write_field(self, field_key: str, value) -> None:
         field = WRITE_FIELDS_BY_KEY[field_key]
         raw = encode_field(field, value)
-        frame = build_d2_write_frame(field.address, raw)
+        frame = build_field_write_frame(field_key, raw)
         self.writes.append((field_key, value))
-        addr = field.address
+        addr = readback_register_address(field)
         for base, data in self.blocks:
             if base <= addr < base + len(data) // 2:
                 off = (addr - base) * 2
@@ -327,8 +339,40 @@ def test_mqtt_invalid_action_then_apply_continues():
     assert calls == ["apply"]
 
 
+def test_charge_mos_protocol81_frame_exact():
+    frame = build_field_write_frame("charge_mos_switch_control", 1)
+    assert frame[0] == PROTOCOL_UNIT_81
+    assert frame[1] == 0x06
+    assert frame[2:6] == bytes.fromhex("01210001")
+    assert len(frame) == WRITE_FRAME_LEN
+    assert check_crc(frame)
+    assert_valid_registry_write_frame(frame, field_key="charge_mos_switch_control", raw_value=1)
+
+
+def test_active_balance_protocol81_frame_exact():
+    frame = build_field_write_frame("active_balance_switch", 1)
+    assert frame[0] == PROTOCOL_UNIT_81
+    assert frame[2:6] == bytes.fromhex("01190001")
+    assert_valid_registry_write_frame(frame, field_key="active_balance_switch", raw_value=1)
+
+
+def test_force_start_protocol81_frame_exact():
+    frame = build_field_write_frame(FORCE_START_FIELD_KEY, 1)
+    assert frame[0] == PROTOCOL_UNIT_81
+    assert frame[2:6] == bytes.fromhex("012e0001")
+    assert_valid_registry_write_frame(frame, field_key=FORCE_START_FIELD_KEY, raw_value=1)
+
+
+def test_discharge_mos_remains_d2_frame():
+    frame = build_field_write_frame("discharge_mos_switch_control", 1)
+    assert frame[0] == PROTOCOL_UNIT_D2
+    assert frame[2:6] == bytes.fromhex("00a60001")
+
+
 def test_no_charge_mos_write_in_registry():
-    assert "charge_mos_switch_control" not in WRITE_FIELDS_BY_KEY
+    field = WRITE_FIELDS_BY_KEY["charge_mos_switch_control"]
+    assert field.protocol_unit == PROTOCOL_UNIT_81
+    assert field.address == 0x0121
 
 
 def test_restart_frame_constant():
@@ -811,3 +855,154 @@ def test_live_alarm_values_publish_number_states():
     assert published["farm/bms1/daly_write/charge_current_high_level_1_alarm_a/state"] == "360.0"
     assert published["farm/bms1/daly_write/discharge_current_high_level_2_alarm_a/state"] == "450.0"
     assert published["farm/bms1/daly_write/charge_temperature_low_level_2_alarm_c/state"] == "-35.0"
+
+
+def test_apply_protocol81_switches_backup_restore(tmp_path, monkeypatch):
+    blocks = build_fixture_blocks()
+    current = values_from_decoded(decode_daly_settings_blocks(blocks))
+    wire = _FakeDalyWire(blocks)
+    staging = DalyStagingState(current=current)
+    staging.stage("charge_mos_switch_control", "off")
+    staging.stage("active_balance_switch", "closed")
+    staging.arm_advanced(now=1000.0)
+    monkeypatch.setattr("bmslib.bms_ble.plugins.daly_full_apply.time.time", lambda: 1000.0)
+
+    result = asyncio.run(
+        apply_staged_settings(wire, staging, device_id="p81", data_dir=tmp_path, now=1000.0)
+    )
+    assert result.ok
+    assert set(result.written_fields) == {"charge_mos_switch_control", "active_balance_switch"}
+    backup = load_backup("p81", tmp_path)
+    assert backup["values"]["charge_mos_switch_control"] == "on"
+    assert backup["values"]["active_balance_switch"] == "open"
+
+    staging2 = DalyStagingState()
+    staging2.arm_advanced(now=1000.0)
+    restore = asyncio.run(restore_last_settings(wire, staging2, device_id="p81", data_dir=tmp_path, now=1000.0))
+    assert restore.ok
+
+
+def test_apply_multiple_tier3_single_arm_authorizes_all(tmp_path, monkeypatch):
+    blocks = build_fixture_blocks()
+    current = values_from_decoded(decode_daly_settings_blocks(blocks))
+    wire = _FakeDalyWire(blocks)
+    staging = DalyStagingState(current=current)
+    staging.stage("charge_mos_switch_control", "off")
+    staging.stage("discharge_mos_switch_control", "off")
+    staging.arm_advanced(now=1000.0)
+    monkeypatch.setattr("bmslib.bms_ble.plugins.daly_full_apply.time.time", lambda: 1000.0)
+
+    result = asyncio.run(
+        apply_staged_settings(wire, staging, device_id="tier3", data_dir=tmp_path, now=1000.0)
+    )
+    assert result.ok
+    assert len(wire.writes) == 2
+    assert not staging.is_armed(1000.0)
+
+
+def test_force_start_unsupported_transmits_zero_bytes(monkeypatch):
+    blocks = build_fixture_blocks()
+    b1, b2 = blocks
+    buf2 = bytearray(b2[1])
+    _set_u16(buf2, 0xD0, 0xD7, FORCE_START_UNSUPPORTED_RAW)
+    blocks = (b1, (b2[0], bytes(buf2)))
+    wire = _FakeDalyWire(blocks)
+    staging = DalyStagingState()
+    staging.arm_advanced(now=1000.0)
+    monkeypatch.setattr("bmslib.bms_ble.plugins.daly_full_apply.time.time", lambda: 1000.0)
+
+    result = asyncio.run(trigger_force_start(wire, staging, now=1000.0))
+    assert not result.ok
+    assert result.status == "force_start_unsupported"
+    assert wire.writes == []
+
+
+def test_force_start_supported_armed_writes_protocol81(tmp_path, monkeypatch):
+    blocks = build_fixture_blocks()
+    wire = _FakeDalyWire(blocks)
+    staging = DalyStagingState()
+    staging.arm_advanced(now=1000.0)
+    monkeypatch.setattr("bmslib.bms_ble.plugins.daly_full_apply.time.time", lambda: 1000.0)
+
+    result = asyncio.run(trigger_force_start(wire, staging, now=1000.0))
+    assert result.ok
+    assert wire.writes == [(FORCE_START_FIELD_KEY, 1)]
+    frame = build_field_write_frame(FORCE_START_FIELD_KEY, 1)
+    assert frame[0] == PROTOCOL_UNIT_81
+    assert not staging.is_armed(1000.0)
+
+
+def test_force_start_already_active_is_noop_without_write(monkeypatch):
+    blocks = build_fixture_blocks()
+    b1, b2 = blocks
+    buf2 = bytearray(b2[1])
+    _set_u16(buf2, 0xD0, 0xD7, 1)
+    blocks = (b1, (b2[0], bytes(buf2)))
+    wire = _FakeDalyWire(blocks)
+    staging = DalyStagingState()
+    staging.arm_advanced(now=1000.0)
+    monkeypatch.setattr("bmslib.bms_ble.plugins.daly_full_apply.time.time", lambda: 1000.0)
+
+    result = asyncio.run(trigger_force_start(wire, staging, now=1000.0))
+    assert result.ok
+    assert result.status == "force_start_noop"
+    assert wire.writes == []
+
+
+def test_staging_protocol81_selects_does_not_write():
+    blocks = build_fixture_blocks()
+    current = values_from_decoded(decode_daly_settings_blocks(blocks))
+    wire = _FakeDalyWire(blocks)
+    staging = DalyStagingState(current=current)
+    staging.stage("charge_mos_switch_control", "off")
+    staging.stage("active_balance_switch", "closed")
+    assert wire.writes == []
+
+
+def test_bms_protocol81_write_echo_end_to_end():
+    bms = DalyFullBMS.__new__(DalyFullBMS)
+    bms._wire_lock = asyncio.Lock()
+    bms._expected_write_echo = None
+    bms._msg_event = asyncio.Event()
+    bms._msg = None
+    bms.TIMEOUT = 1.0
+    bms._log = MagicMock()
+    bms._client = MagicMock()
+    bms.uuid_tx = lambda: "tx-char"
+    captured: list[bytes] = []
+
+    async def _write(_char, frame, response=False):
+        captured.append(bytes(frame))
+        bms._msg = bytes(frame)
+        bms._msg_event.set()
+
+    bms._client.write_gatt_char = AsyncMock(side_effect=_write)
+    asyncio.run(bms.write_field("charge_mos_switch_control", "on"))
+    assert len(captured) == 1
+    validate_write_echo(captured[0], expected_frame=captured[0])
+    assert captured[0][0] == PROTOCOL_UNIT_81
+
+
+def test_retained_force_start_not_queued():
+    calls: list[str] = []
+
+    async def _handler(_payload: str) -> None:
+        calls.append("force")
+
+    topic = "farm/daly_write/force_start"
+    _daly_action_callbacks.clear()
+    while not _daly_message_queue.empty():
+        _daly_message_queue.get()
+    _daly_action_callbacks[topic] = _handler
+    assert enqueue_daly_action(topic, b"PRESS", retain=True)
+    asyncio.run(mqtt_process_daly_action_queue())
+    assert calls == []
+
+
+def test_protocol81_discovery_includes_force_start_button():
+    discovery = build_daly_full_discovery("farm/bms1", {"identifiers": ["farm/bms1"]}, 60)
+    topic = "homeassistant/button/farm_bms1/daly_force_start/config"
+    assert topic in discovery
+    assert discovery[topic]["name"] == "Force Start"
+    charge_sel = discovery["homeassistant/select/farm_bms1/daly_charge_mos_switch_control/config"]
+    assert charge_sel["name"] == "Charge MOS"

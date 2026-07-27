@@ -28,6 +28,7 @@ from bmslib.bms_ble.plugins.daly_full_protocol import (
     build_field_write_frame,
     build_restart_write_frame,
     validate_d2_write_echo,
+    validate_write_echo,
 )
 from bmslib.bms_ble.plugins.daly_full_write_registry import WRITE_FIELDS_BY_KEY, encode_field
 from bmslib.util import get_logger
@@ -159,7 +160,7 @@ class BMS(DalyBMS):
 
         if self._expected_write_echo is not None:
             try:
-                validate_d2_write_echo(raw, expected_frame=self._expected_write_echo)
+                validate_write_echo(raw, expected_frame=self._expected_write_echo)
             except ValueError:
                 self._log.debug("ignored non-matching write echo")
                 return
@@ -220,7 +221,7 @@ class BMS(DalyBMS):
                 self._msg_event.clear()
                 await self._client.write_gatt_char(self.uuid_tx(), frame, response=False)
                 await asyncio.wait_for(self._msg_event.wait(), timeout=self.TIMEOUT)
-                validate_d2_write_echo(self._msg, expected_frame=frame)
+                validate_write_echo(self._msg, expected_frame=frame)
             finally:
                 self._expected_write_echo = None
 
@@ -232,7 +233,7 @@ class BMS(DalyBMS):
                 self._msg_event.clear()
                 await self._client.write_gatt_char(self.uuid_tx(), frame, response=False)
                 await asyncio.wait_for(self._msg_event.wait(), timeout=self.TIMEOUT)
-                validate_d2_write_echo(self._msg, expected_frame=frame)
+                validate_write_echo(self._msg, expected_frame=frame)
             finally:
                 self._expected_write_echo = None
 

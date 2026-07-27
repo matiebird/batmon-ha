@@ -245,6 +245,13 @@ class BMS():
                 device_id=self.address,
             )
 
+    async def trigger_force_start(self):
+        from bmslib.bms_ble.plugins.daly_full_apply import trigger_force_start
+        if not self.daly_writable or self._daly_staging is None or self.ble_bms is None:
+            raise RuntimeError("daly writable controls not enabled")
+        async with self.ble_bms._operation_lock:
+            return await trigger_force_start(self.ble_bms, self._daly_staging)
+
     def current_daly_values(self) -> dict:
         decoded = getattr(self.ble_bms, 'decoded_settings', None) if self.ble_bms else None
         if decoded is None:

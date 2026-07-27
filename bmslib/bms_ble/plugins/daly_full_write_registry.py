@@ -1,4 +1,4 @@
-"""Allowlisted Daly D2 standard write registry (no YC, no protocol 81)."""
+"""Allowlisted Daly D2 and limited protocol-81 write registry."""
 
 from __future__ import annotations
 
@@ -8,6 +8,7 @@ from enum import Enum
 from typing import Any, Callable, Final, Mapping, Optional
 
 from bmslib.bms_ble.plugins.daly_full_decode import (
+    ACTIVE_BALANCE_SWITCH,
     BATTERY_CHEMISTRY,
     COMMUNICATION_METHOD,
     INVERTER_MANUFACTURER_WRITE,
@@ -15,10 +16,16 @@ from bmslib.bms_ble.plugins.daly_full_decode import (
     INVERTER_SELF_IDENTIFY_RAW,
     MOS_SWITCH,
 )
+from bmslib.bms_ble.plugins.daly_full_protocol import PROTOCOL_UNIT_81, PROTOCOL_UNIT_D2
 
 HIBERNATE_SPECIAL_RAW: Final[int] = 65535
 RESTART_ADDRESS: Final[int] = 0x00F0
 RESTART_FIELD_KEY: Final[str] = "system_restart"
+FORCE_START_FIELD_KEY: Final[str] = "force_start"
+FORCE_START_UNSUPPORTED_RAW: Final[int] = 65535
+CHARGE_MOS_81_ADDRESS: Final[int] = 0x0121
+ACTIVE_BALANCE_81_ADDRESS: Final[int] = 0x0119
+FORCE_START_81_ADDRESS: Final[int] = 0x012E
 CHARGE_CURRENT_ALARM_MAX_A: Final[float] = 3000.0
 DISCHARGE_CURRENT_ALARM_MAX_A: Final[float] = 3553.5
 TEMPERATURE_ALARM_MIN_C: Final[float] = -40.0
@@ -43,11 +50,14 @@ class DalyWriteField:
     unit: Optional[str] = None
     precision: int = 0
     options: Optional[tuple[str, ...]] = None
+    display_name: Optional[str] = None
     requires_arm: bool = False
     encode: Callable[[Any], int] = lambda v: int(v)
     validate: Callable[[Any], None] = lambda v: None
     min_value: Optional[float] = None
     max_value: Optional[float] = None
+    protocol_unit: int = PROTOCOL_UNIT_D2
+    readback_d2_address: Optional[int] = None
 
 
 def _reject_non_numeric(value: Any) -> float:
@@ -238,6 +248,7 @@ _INVERTER_LABEL_TO_RAW[INVERTER_SELF_IDENTIFY_LABEL] = INVERTER_SELF_IDENTIFY_RA
 _INVERTER_VALIDATE_TABLE = dict(INVERTER_MANUFACTURER_WRITE)
 _INVERTER_VALIDATE_TABLE[INVERTER_SELF_IDENTIFY_RAW] = INVERTER_SELF_IDENTIFY_LABEL
 _MOS_OPTIONS = tuple(MOS_SWITCH.values())
+_BALANCE_OPTIONS = tuple(ACTIVE_BALANCE_SWITCH.values())
 
 
 WRITE_FIELDS: Final[tuple[DalyWriteField, ...]] = (
@@ -321,20 +332,47 @@ WRITE_FIELDS: Final[tuple[DalyWriteField, ...]] = (
     DalyWriteField("D2-BAL-DIFF", "balance_start_voltage_difference_v", 0x00A4, EntityType.NUMBER, 2,
                    "balance_start_voltage_difference_v", "EqualizationSettingFragment.java:510-537", "V", 3,
                    encode=_encode_u16_div1000, validate=_validate_cell_voltage),
+    DalyWriteField("81-CHG-MOS", "charge_mos_switch_control", CHARGE_MOS_81_ADDRESS, EntityType.SELECT, 3,
+                   "charge_mos_switch_control", "ControlSettingFragment.java:1177-1268",
+                   protocol_unit=PROTOCOL_UNIT_81, readback_d2_address=0x00A5, options=_MOS_OPTIONS,
+                   display_name="Charge MOS", requires_arm=True,
+                   encode=lambda v: _encode_enum(v, MOS_SWITCH),
+                   validate=lambda v: _validate_enum_option(v, MOS_SWITCH)),
+    DalyWriteField("81-ACT-BAL", "active_balance_switch", ACTIVE_BALANCE_81_ADDRESS, EntityType.SELECT, 3,
+                   "active_balance_switch", "ControlSettingFragment.java:1177-1268",
+                   protocol_unit=PROTOCOL_UNIT_81, readback_d2_address=0x00CF, options=_BALANCE_OPTIONS,
+                   display_name="Active Balance", requires_arm=True,
+                   encode=lambda v: _encode_enum(v, ACTIVE_BALANCE_SWITCH),
+                   validate=lambda v: _validate_enum_option(v, ACTIVE_BALANCE_SWITCH)),
     DalyWriteField("D2-DCHG-MOS", "discharge_mos_switch_control", 0x00A6, EntityType.SELECT, 3,
-                   "discharge_mos_switch_control", "ControlSettingFragment.java:1177-1268", options=_MOS_OPTIONS,
+                   "discharge_mos_switch_control", "ControlSettingFragment.java:1177-1268",
+                   options=_MOS_OPTIONS, display_name="Discharge MOS",
                    requires_arm=True,
                    encode=lambda v: _encode_enum(v, MOS_SWITCH),
                    validate=lambda v: _validate_enum_option(v, MOS_SWITCH)),
     DalyWriteField("D2-RESTART", RESTART_FIELD_KEY, RESTART_ADDRESS, EntityType.BUTTON, 3,
                    RESTART_FIELD_KEY, "ControlSettingFragment.java:1047-1076",
                    requires_arm=True, encode=lambda _v: 0),
+    DalyWriteField("81-FORCE-START", FORCE_START_FIELD_KEY, FORCE_START_81_ADDRESS, EntityType.BUTTON, 3,
+                   "force_start_switch", "ControlSettingFragment.java:1177-1268",
+                   protocol_unit=PROTOCOL_UNIT_81, readback_d2_address=0x00D7, display_name="Force Start",
+                   requires_arm=True, encode=lambda _v: 1),
 )
+
+def readback_register_address(field: DalyWriteField) -> int:
+    if field.readback_d2_address is not None:
+        return field.readback_d2_address
+    return field.address
 
 WRITE_FIELDS_BY_KEY: Final[dict[str, DalyWriteField]] = {f.key: f for f in WRITE_FIELDS}
 WRITE_FIELDS_BY_ID: Final[dict[str, DalyWriteField]] = {f.field_id: f for f in WRITE_FIELDS}
-WRITE_FIELDS_BY_ADDRESS: Final[dict[int, DalyWriteField]] = {f.address: f for f in WRITE_FIELDS}
-ALLOWED_WRITE_ADDRESSES: Final[frozenset[int]] = frozenset(WRITE_FIELDS_BY_ADDRESS)
+ALLOWED_D2_WRITE_ADDRESSES: Final[frozenset[int]] = frozenset(
+    f.address for f in WRITE_FIELDS if f.protocol_unit == PROTOCOL_UNIT_D2
+)
+ALLOWED_81_WRITE_ADDRESSES: Final[frozenset[int]] = frozenset(
+    f.address for f in WRITE_FIELDS if f.protocol_unit == PROTOCOL_UNIT_81
+)
+ALLOWED_WRITE_ADDRESSES: Final[frozenset[int]] = ALLOWED_D2_WRITE_ADDRESSES
 EXCLUDED_WRITE_ADDRESSES: Final[frozenset[int]] = frozenset({0x0580, 0x0508, 0x050A, 0x050C, 0x0512, 0x0513, 0x0515, 0x0517, 0x050F})
 
 

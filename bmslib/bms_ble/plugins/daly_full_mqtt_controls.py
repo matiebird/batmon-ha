@@ -11,6 +11,8 @@ import paho.mqtt.client as paho
 
 from bmslib.bms_ble.plugins.daly_full_staging import DalyStagingState
 from bmslib.bms_ble.plugins.daly_full_write_registry import (
+    FORCE_START_FIELD_KEY,
+    RESTART_FIELD_KEY,
     WRITE_FIELDS,
     EntityType,
 )
@@ -27,6 +29,7 @@ ACTION_DISCARD = "discard"
 ACTION_RESTORE = "restore"
 ACTION_ARM = "arm_advanced"
 ACTION_RESTART = "restart"
+ACTION_FORCE_START = "force_start"
 
 
 def _entity_slug(key: str) -> str:
@@ -76,21 +79,29 @@ def build_daly_full_discovery(
 
     for field in WRITE_FIELDS:
         if field.entity_type == EntityType.BUTTON:
-            if field.key != "system_restart":
-                continue
-            discovery["homeassistant/button/%s/%s/config" % (node_id, _entity_slug(field.key))] = {
-                "unique_id": "%s__%s" % (device_topic, field.key),
-                "name": "Restart DALY BMS",
-                "entity_category": "config",
-                "device": device_json,
-                "command_topic": _button_command_topic(device_topic, ACTION_RESTART),
-            }
+            if field.key == RESTART_FIELD_KEY:
+                discovery["homeassistant/button/%s/%s/config" % (node_id, _entity_slug(field.key))] = {
+                    "unique_id": "%s__%s" % (device_topic, field.key),
+                    "name": "Restart DALY BMS",
+                    "entity_category": "config",
+                    "device": device_json,
+                    "command_topic": _button_command_topic(device_topic, ACTION_RESTART),
+                }
+            elif field.key == FORCE_START_FIELD_KEY:
+                discovery["homeassistant/button/%s/%s/config" % (node_id, _entity_slug(field.key))] = {
+                    "unique_id": "%s__%s" % (device_topic, field.key),
+                    "name": field.display_name or "Force Start",
+                    "entity_category": "config",
+                    "device": device_json,
+                    "command_topic": _button_command_topic(device_topic, ACTION_FORCE_START),
+                }
             continue
 
         slug = _entity_slug(field.key)
+        label = field.display_name or capitalize_words(field.key.replace("_", " "))
         base = {
             "unique_id": "%s__write_%s" % (device_topic, field.key),
-            "name": capitalize_words(field.key.replace("_", " ")),
+            "name": label,
             "entity_category": "config",
             "device": device_json,
             "state_topic": _field_state_topic(device_topic, field.key),
@@ -235,7 +246,7 @@ def subscribe_daly_full_controls(
             _bind(_field_command_topic(device_topic, field.key), field.key)
 
     _bind(_arm_command_topic(device_topic), ACTION_ARM)
-    for action in (ACTION_APPLY, ACTION_DISCARD, ACTION_RESTORE, ACTION_RESTART):
+    for action in (ACTION_APPLY, ACTION_DISCARD, ACTION_RESTORE, ACTION_RESTART, ACTION_FORCE_START):
         _bind(_button_command_topic(device_topic, action), action)
 
     logger.debug("subscribed daly_full controls for %s", node_id)
@@ -277,6 +288,7 @@ def daly_action_topics_for_device(device_topic: str) -> set[str]:
         _button_command_topic(device_topic, ACTION_DISCARD),
         _button_command_topic(device_topic, ACTION_RESTORE),
         _button_command_topic(device_topic, ACTION_RESTART),
+        _button_command_topic(device_topic, ACTION_FORCE_START),
     }
     for field in WRITE_FIELDS:
         if field.entity_type in (EntityType.NUMBER, EntityType.SELECT):

@@ -12,6 +12,8 @@ from bmslib.bms_ble.plugins.daly_full_decode import DecodedDalySettings, decode_
 from bmslib.bms_ble.plugins.daly_full_staging import DalyStagingState
 from bmslib.bms_ble.plugins.daly_full_write_registry import (
     DalyWriteField,
+    FORCE_START_FIELD_KEY,
+    FORCE_START_UNSUPPORTED_RAW,
     RESTART_FIELD_KEY,
     WRITE_FIELDS_BY_KEY,
     build_write_plan,
@@ -104,6 +106,7 @@ async def apply_staged_settings(
             return ApplyResult(False, "backup_failed")
 
     written: list[str] = []
+    tier3_transaction = any(field_def.requires_arm for field_def, _, _ in plan)
     try:
         for field_def, raw, staged_val in plan:
             if field_def.requires_arm and not staging.is_armed(time.time()):
@@ -122,9 +125,6 @@ async def apply_staged_settings(
             except Exception:
                 staging.record_apply_result("write_failed", field=field_def.key, when=t)
                 return ApplyResult(False, "write_failed", failed_field=field_def.key, written_fields=tuple(written))
-            finally:
-                if field_def.requires_arm:
-                    staging.disarm_advanced()
 
             try:
                 blocks_after = await wire.fetch_settings_blocks(force=True)
@@ -164,6 +164,9 @@ async def apply_staged_settings(
     except asyncio.CancelledError:
         staging.record_apply_result("apply_cancelled", when=t)
         raise
+    finally:
+        if tier3_transaction:
+            staging.disarm_advanced()
 
     staging.update_current(final)
     staging.discard()
@@ -205,6 +208,61 @@ async def restart_daly_system(
 
     staging.record_apply_result("restart_ok", when=t)
     return ApplyResult(True, "restart_ok", written_fields=(RESTART_FIELD_KEY,))
+
+
+async def trigger_force_start(
+    wire: DalyWire,
+    staging: DalyStagingState,
+    *,
+    now: Optional[float] = None,
+) -> ApplyResult:
+    t = now if now is not None else time.time()
+    if not staging.is_armed(time.time()):
+        staging.record_apply_result("force_start_unarmed", when=t)
+        return ApplyResult(False, "force_start_unarmed", failed_field=FORCE_START_FIELD_KEY)
+
+    try:
+        blocks = await wire.fetch_settings_blocks(force=True)
+    except asyncio.CancelledError:
+        staging.record_apply_result("force_start_cancelled", when=t)
+        raise
+    except Exception:
+        staging.record_apply_result("force_start_read_failed", when=t)
+        return ApplyResult(False, "force_start_read_failed", failed_field=FORCE_START_FIELD_KEY)
+
+    decoded = decode_daly_settings_blocks(blocks)
+    current_state = decoded.values.get("force_start_switch")
+    if current_state == FORCE_START_UNSUPPORTED_RAW:
+        staging.record_apply_result("force_start_unsupported", when=t)
+        return ApplyResult(False, "force_start_unsupported", failed_field=FORCE_START_FIELD_KEY)
+
+    if current_state not in (0, 0.0):
+        staging.record_apply_result("force_start_noop", when=t)
+        return ApplyResult(True, "force_start_noop", written_fields=())
+
+    try:
+        await wire.write_field(FORCE_START_FIELD_KEY, 1)
+    except asyncio.CancelledError:
+        staging.record_apply_result("force_start_cancelled", when=t)
+        raise
+    except Exception:
+        staging.record_apply_result("force_start_failed", when=t)
+        return ApplyResult(False, "force_start_failed", failed_field=FORCE_START_FIELD_KEY)
+    finally:
+        staging.disarm_advanced()
+
+    try:
+        await wire.reconnect()
+        await wire.fetch_settings_blocks(force=True)
+    except asyncio.CancelledError:
+        staging.record_apply_result("force_start_cancelled", when=t)
+        raise
+    except Exception:
+        staging.record_apply_result("force_start_reconnect_failed", when=t)
+        return ApplyResult(False, "force_start_reconnect_failed", failed_field=FORCE_START_FIELD_KEY)
+
+    staging.record_apply_result("force_start_ok", when=t)
+    return ApplyResult(True, "force_start_ok", written_fields=(FORCE_START_FIELD_KEY,))
 
 
 async def restore_last_settings(
