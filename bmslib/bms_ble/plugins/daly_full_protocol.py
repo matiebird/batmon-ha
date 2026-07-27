@@ -4,9 +4,6 @@ from __future__ import annotations
 
 from typing import Final
 
-from aiobmsble.basebms import crc_modbus
-from aiobmsble.bms.daly_bms import BMS as DalyBMS
-
 PROTOCOL_UNIT_D2: Final[int] = 0xD2
 PROTOCOL_UNIT_81: Final[int] = 0x81
 PROTOCOL_UNIT: Final[int] = PROTOCOL_UNIT_D2
@@ -17,12 +14,32 @@ WRITE_FRAME_LEN: Final[int] = 8
 RESTART_ADDRESS: Final[int] = 0x00F0
 
 
+def crc_modbus(data: bytes | bytearray) -> int:
+    """Standard Modbus CRC16 (poly 0xA001, init 0xFFFF)."""
+    crc = 0xFFFF
+    for byte in data:
+        crc ^= byte & 0xFF
+        for _ in range(8):
+            crc = (crc >> 1) ^ 0xA001 if crc & 1 else crc >> 1
+    return crc & 0xFFFF
+
+
 def modbus_crc_append(frame: bytes) -> bytes:
     return frame + crc_modbus(frame).to_bytes(2, "little")
 
 
+def _build_modbus_read_frame(dev_id: int, fct: int, addr: int, count: int) -> bytes:
+    frame = (
+        dev_id.to_bytes(1)
+        + fct.to_bytes(1)
+        + addr.to_bytes(2, "big")
+        + count.to_bytes(2, "big")
+    )
+    return modbus_crc_append(frame)
+
+
 def build_d2_read_frame(addr: int, count: int) -> bytes:
-    return DalyBMS._cmd_modbus(dev_id=PROTOCOL_UNIT_D2, fct=READ_FUNCTION, addr=addr, count=count)
+    return _build_modbus_read_frame(PROTOCOL_UNIT_D2, READ_FUNCTION, addr, count)
 
 
 def assert_allowlisted_write(protocol_unit: int, addr: int) -> None:
